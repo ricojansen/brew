@@ -1,5 +1,5 @@
 /**
- * @license r.js 0.27.1 Copyright (c) 2010-2011, The Dojo Foundation All Rights Reserved.
+ * @license r.js 0.25.0+ Copyright (c) 2010-2011, The Dojo Foundation All Rights Reserved.
  * Available via the MIT or new BSD license.
  * see: http://github.com/jrburke/requirejs for details
  */
@@ -11,7 +11,7 @@
  * the shell of the r.js file.
  */
 
-/*jslint strict: false, evil: true, nomen: false */
+/*jslint strict: false, evil: true */
 /*global readFile: true, process: false, Packages: false, print: false,
 console: false, java: false, module: false */
 
@@ -19,9 +19,12 @@ var requirejs, require, define;
 (function (console, args, readFileFunc) {
 
     var fileName, env, fs, vm, path, exec, rhinoContext, dir, nodeRequire,
-        nodeDefine, exists, reqMain, loadedOptimizedLib,
-        version = '0.27.1',
+        nodeDefine, exists, reqMain,
+        version = '0.25.0+',
         jsSuffixRegExp = /\.js$/,
+        //Indicates so build/build.js that the modules for the optimizer
+        //are built-in.
+        isRjs = true,
         commandOption = '',
         //Used by jslib/rhino/args.js
         rhinoArgs = args,
@@ -101,11 +104,11 @@ var requirejs, require, define;
     }
 
     /** vim: et:ts=4:sw=4:sts=4
- * @license RequireJS 0.27.1 Copyright (c) 2010-2011, The Dojo Foundation All Rights Reserved.
+ * @license RequireJS 0.26.0 Copyright (c) 2010-2011, The Dojo Foundation All Rights Reserved.
  * Available via the MIT or new BSD license.
  * see: http://github.com/jrburke/requirejs for details
  */
-/*jslint strict: false, plusplus: false, sub: true */
+/*jslint strict: false, plusplus: false */
 /*global window: false, navigator: false, document: false, importScripts: false,
   jQuery: false, clearInterval: false, setInterval: false, self: false,
   setTimeout: false, opera: false */
@@ -113,7 +116,7 @@ var requirejs, require, define;
 
 (function () {
     //Change this version number for each release.
-    var version = "0.27.1",
+    var version = "0.26.0",
         commentRegExp = /(\/\*([\s\S]*?)\*\/|\/\/(.*)$)/mg,
         cjsRequireRegExp = /require\(\s*["']([^'"\s]+)["']\s*\)/g,
         currDirRegExp = /^\.\//,
@@ -133,14 +136,17 @@ var requirejs, require, define;
         defContextName = "_",
         //Oh the tragedy, detecting opera. See the usage of isOpera for reason.
         isOpera = typeof opera !== "undefined" && opera.toString() === "[object Opera]",
+        reqWaitIdPrefix = "_r@@",
         empty = {},
         contexts = {},
         globalDefQueue = [],
         interactiveScript = null,
+        isDone = false,
         checkLoadedDepth = 0,
         useInteractive = false,
         req, cfg = {}, currentlyAddingScript, s, head, baseElement, scripts, script,
-        src, subPath, mainScript, dataMain, i, ctx, jQueryCheck, checkLoadedTimeoutId;
+        src, subPath, mainScript, dataMain, i, scrollIntervalId, setReadyState, ctx,
+        jQueryCheck, checkLoadedTimeoutId;
 
     function isFunction(it) {
         return ostring.call(it) === "[object Function]";
@@ -271,7 +277,7 @@ var requirejs, require, define;
         var context, resume,
             config = {
                 waitSeconds: 7,
-                baseUrl: "./",
+                baseUrl: s.baseUrl || "./",
                 paths: {},
                 pkgs: {},
                 catchError: {}
@@ -287,15 +293,12 @@ var requirejs, require, define;
             loaded = {},
             waiting = {},
             waitAry = [],
-            urlFetched = {},
-            managerCounter = 0,
+            waitIdCounter = 0,
             managerCallbacks = {},
             plugins = {},
-            //Used to indicate which modules in a build scenario
-            //need to be full executed.
-            needFullExec = {},
-            fullExec = {},
-            resumeDepth = 0;
+            pluginsQueue = {},
+            resumeDepth = 0,
+            normalizedWaiting = {};
 
         /**
          * Trims the . and .. from an array of path segments.
@@ -406,26 +409,41 @@ var requirejs, require, define;
             if (name) {
                 if (prefix) {
                     pluginModule = defined[prefix];
-                    if (pluginModule && pluginModule.normalize) {
-                        //Plugin is loaded, use its normalize method.
-                        normalizedName = pluginModule.normalize(name, function (name) {
-                            return normalize(name, parentName);
-                        });
+                    if (pluginModule) {
+                        //Plugin is loaded, use its normalize method, otherwise,
+                        //normalize name as usual.
+                        if (pluginModule.normalize) {
+                            normalizedName = pluginModule.normalize(name, function (name) {
+                                return normalize(name, parentName);
+                            });
+                        } else {
+                            normalizedName = normalize(name, parentName);
+                        }
                     } else {
-                        normalizedName = normalize(name, parentName);
+                        //Plugin is not loaded yet, so do not normalize
+                        //the name, wait for plugin to load to see if
+                        //it has a normalize method. To avoid possible
+                        //ambiguity with relative names loaded from another
+                        //plugin, use the parent's name as part of this name.
+                        normalizedName = '__$p' + parentName + '@' + (name || '');
                     }
                 } else {
-                    //A regular module.
                     normalizedName = normalize(name, parentName);
+                }
 
-                    url = urlMap[normalizedName];
-                    if (!url) {
-                        //Calculate url for the module, if it has a name.
+                url = urlMap[normalizedName];
+                if (!url) {
+                    //Calculate url for the module, if it has a name.
+                    if (req.toModuleUrl) {
+                        //Special logic required for a particular engine,
+                        //like Node.
+                        url = req.toModuleUrl(context, normalizedName, parentModuleMap);
+                    } else {
                         url = context.nameToUrl(normalizedName, null, parentModuleMap);
-
-                        //Store the URL mapping for later.
-                        urlMap[normalizedName] = url;
                     }
+
+                    //Store the URL mapping for later.
+                    urlMap[normalizedName] = url;
                 }
             }
 
@@ -460,12 +478,23 @@ var requirejs, require, define;
             return priorityDone;
         }
 
+        /**
+         * Helper function that creates a setExports function for a "module"
+         * CommonJS dependency. Do this here to avoid creating a closure that
+         * is part of a loop.
+         */
+        function makeSetExports(moduleObj) {
+            return function (exports) {
+                moduleObj.exports = exports;
+            };
+        }
+
         function makeContextModuleFunc(func, relModuleMap, enableBuildCallback) {
             return function () {
                 //A version of a require function that passes a moduleName
                 //value for items that may need to
                 //look up paths relative to the moduleName
-                var args = aps.call(arguments, 0), lastArg;
+                var args = [].concat(aps.call(arguments, 0)), lastArg;
                 if (enableBuildCallback &&
                     isFunction((lastArg = args[args.length - 1]))) {
                     lastArg.__requireJsBuild = true;
@@ -489,30 +518,136 @@ var requirejs, require, define;
                 toUrl: makeContextModuleFunc(context.toUrl, relModuleMap),
                 defined: makeContextModuleFunc(context.requireDefined, relModuleMap),
                 specified: makeContextModuleFunc(context.requireSpecified, relModuleMap),
+                ready: req.ready,
                 isBrowser: req.isBrowser
             });
+            //Something used by node.
+            if (req.paths) {
+                modRequire.paths = req.paths;
+            }
             return modRequire;
+        }
+
+        /**
+         * Used to update the normalized name for plugin-based dependencies
+         * after a plugin loads, since it can have its own normalization structure.
+         * @param {String} pluginName the normalized plugin module name.
+         */
+        function updateNormalizedNames(pluginName) {
+
+            var oldFullName, oldModuleMap, moduleMap, fullName, callbacks,
+                i, j, k, depArray, existingCallbacks,
+                maps = normalizedWaiting[pluginName];
+
+            if (maps) {
+                for (i = 0; (oldModuleMap = maps[i]); i++) {
+                    oldFullName = oldModuleMap.fullName;
+                    moduleMap = makeModuleMap(oldModuleMap.originalName, oldModuleMap.parentMap);
+                    fullName = moduleMap.fullName;
+                    //Callbacks could be undefined if the same plugin!name was
+                    //required twice in a row, so use empty array in that case.
+                    callbacks = managerCallbacks[oldFullName] || [];
+                    existingCallbacks = managerCallbacks[fullName];
+
+                    if (fullName !== oldFullName) {
+                        //Update the specified object, but only if it is already
+                        //in there. In sync environments, it may not be yet.
+                        if (oldFullName in specified) {
+                            delete specified[oldFullName];
+                            specified[fullName] = true;
+                        }
+
+                        //Update managerCallbacks to use the correct normalized name.
+                        //If there are already callbacks for the normalized name,
+                        //just add to them.
+                        if (existingCallbacks) {
+                            managerCallbacks[fullName] = existingCallbacks.concat(callbacks);
+                        } else {
+                            managerCallbacks[fullName] = callbacks;
+                        }
+                        delete managerCallbacks[oldFullName];
+
+                        //In each manager callback, update the normalized name in the depArray.
+                        for (j = 0; j < callbacks.length; j++) {
+                            depArray = callbacks[j].depArray;
+                            for (k = 0; k < depArray.length; k++) {
+                                if (depArray[k] === oldFullName) {
+                                    depArray[k] = fullName;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            delete normalizedWaiting[pluginName];
         }
 
         /*
          * Queues a dependency for checking after the loader is out of a
          * "paused" state, for example while a script file is being loaded
          * in the browser, where it may have many modules defined in it.
+         *
+         * depName will be fully qualified, no relative . or .. path.
          */
-        function queueDependency(manager) {
-            context.paused.push(manager);
+        function queueDependency(dep) {
+            //Make sure to load any plugin and associate the dependency
+            //with that plugin.
+            var prefix = dep.prefix,
+                fullName = dep.fullName;
+
+            //Do not bother if the depName is already in transit
+            if (specified[fullName] || fullName in defined) {
+                return;
+            }
+
+            if (prefix && !plugins[prefix]) {
+                //Queue up loading of the dependency, track it
+                //via context.plugins. Mark it as a plugin so
+                //that the build system will know to treat it
+                //special.
+                plugins[prefix] = undefined;
+
+                //Remember this dep that needs to have normaliztion done
+                //after the plugin loads.
+                (normalizedWaiting[prefix] || (normalizedWaiting[prefix] = []))
+                    .push(dep);
+
+                //Register an action to do once the plugin loads, to update
+                //all managerCallbacks to use a properly normalized module
+                //name.
+                (managerCallbacks[prefix] ||
+                (managerCallbacks[prefix] = [])).push({
+                    onDep: function (name, value) {
+                        if (name === prefix) {
+                            updateNormalizedNames(prefix);
+                        }
+                    }
+                });
+
+                queueDependency(makeModuleMap(prefix));
+            }
+
+            context.paused.push(dep);
         }
 
         function execManager(manager) {
-            var i, ret, err, errFile, errModuleTree,
+            var i, ret, waitingCallbacks, err, errFile,
                 cb = manager.callback,
-                map = manager.map,
-                fullName = map.fullName,
-                args = manager.deps,
-                listeners = manager.listeners;
+                fullName = manager.fullName,
+                args = [],
+                ary = manager.depArray;
 
             //Call the callback to define the module, if necessary.
             if (cb && isFunction(cb)) {
+                //Pull out the defined dependencies and pass the ordered
+                //values to the callback.
+                if (ary) {
+                    for (i = 0; i < ary.length; i++) {
+                        args.push(manager.deps[ary[i]]);
+                    }
+                }
+
                 if (config.catchError.define) {
                     try {
                         ret = req.execCb(fullName, manager.callback, args, defined[fullName]);
@@ -535,32 +670,21 @@ var requirejs, require, define;
                     } else {
                         //Use the return value from the function.
                         defined[fullName] = ret;
-                        //If this module needed full execution in a build
-                        //environment, mark that now.
-                        if (needFullExec[fullName]) {
-                            fullExec[fullName] = true;
-                        }
                     }
                 }
             } else if (fullName) {
                 //May just be an object definition for the module. Only
                 //worry about defining if have a module name.
                 ret = defined[fullName] = cb;
-
-                //If this module needed full execution in a build
-                //environment, mark that now.
-                if (needFullExec[fullName]) {
-                    fullExec[fullName] = true;
-                }
             }
 
             //Clean up waiting. Do this before error calls, and before
-            //calling back listeners, so that bookkeeping is correct
+            //calling back waitingCallbacks, so that bookkeeping is correct
             //in the event of an error and error is reported in correct order,
-            //since the listeners will likely have errors if the
+            //since the waitingCallbacks will likely have errors if the
             //onError function does not throw.
-            if (waiting[manager.id]) {
-                delete waiting[manager.id];
+            if (waiting[manager.waitId]) {
+                delete waiting[manager.waitId];
                 manager.isDone = true;
                 context.waitCount -= 1;
                 if (context.waitCount === 0) {
@@ -569,241 +693,68 @@ var requirejs, require, define;
                 }
             }
 
-            //Do not need to track manager callback now that it is defined.
-            delete managerCallbacks[fullName];
-
-            //Allow instrumentation like the optimizer to know the order
-            //of modules executed and their dependencies.
-            if (req.onResourceLoad && !manager.placeholder) {
-                req.onResourceLoad(context, map, manager.depArray);
-            }
-
             if (err) {
                 errFile = (fullName ? makeModuleMap(fullName).url : '') ||
                            err.fileName || err.sourceURL;
-                errModuleTree = err.moduleTree;
                 err = makeError('defineerror', 'Error evaluating ' +
                                 'module "' + fullName + '" at location "' +
                                 errFile + '":\n' +
                                 err + '\nfileName:' + errFile +
                                 '\nlineNumber: ' + (err.lineNumber || err.line), err);
                 err.moduleName = fullName;
-                err.moduleTree = errModuleTree;
                 return req.onError(err);
             }
 
-            //Let listeners know of this manager's value.
-            for (i = 0; (cb = listeners[i]); i++) {
-                cb(ret);
+            if (fullName) {
+                //If anything was waiting for this module to be defined,
+                //notify them now.
+                waitingCallbacks = managerCallbacks[fullName];
+                if (waitingCallbacks) {
+                    for (i = 0; i < waitingCallbacks.length; i++) {
+                        waitingCallbacks[i].onDep(fullName, ret);
+                    }
+                    delete managerCallbacks[fullName];
+                }
             }
 
             return undefined;
-        }
-
-        /**
-         * Helper that creates a callack function that is called when a dependency
-         * is ready, and sets the i-th dependency for the manager as the
-         * value passed to the callback generated by this function.
-         */
-        function makeArgCallback(manager, i) {
-            return function (value) {
-                //Only do the work if it has not been done
-                //already for a dependency. Cycle breaking
-                //logic in forceExec could mean this function
-                //is called more than once for a given dependency.
-                if (!manager.depDone[i]) {
-                    manager.depDone[i] = true;
-                    manager.deps[i] = value;
-                    manager.depCount -= 1;
-                    if (!manager.depCount) {
-                        //All done, execute!
-                        execManager(manager);
-                    }
-                }
-            };
-        }
-
-        function callPlugin(pluginName, depManager) {
-            var map = depManager.map,
-                fullName = map.fullName,
-                name = map.name,
-                plugin = plugins[pluginName] ||
-                        (plugins[pluginName] = defined[pluginName]),
-                load;
-
-            //No need to continue if the manager is already
-            //in the process of loading.
-            if (depManager.loading) {
-                return;
-            }
-            depManager.loading = true;
-
-            load = function (ret) {
-                depManager.callback = function () {
-                    return ret;
-                };
-                execManager(depManager);
-
-                loaded[depManager.id] = true;
-
-                //The loading of this plugin
-                //might have placed other things
-                //in the paused queue. In particular,
-                //a loader plugin that depends on
-                //a different plugin loaded resource.
-                resume();
-            };
-
-            //Allow plugins to load other code without having to know the
-            //context or how to "complete" the load.
-            load.fromText = function (moduleName, text) {
-                /*jslint evil: true */
-                var hasInteractive = useInteractive;
-
-                //Indicate a the module is in process of loading.
-                loaded[moduleName] = false;
-                context.scriptCount += 1;
-
-                //Indicate this is not a "real" module, so do not track it
-                //for builds, it does not map to a real file.
-                context.fake[moduleName] = true;
-
-                //Turn off interactive script matching for IE for any define
-                //calls in the text, then turn it back on at the end.
-                if (hasInteractive) {
-                    useInteractive = false;
-                }
-
-                req.exec(text);
-
-                if (hasInteractive) {
-                    useInteractive = true;
-                }
-
-                //Support anonymous modules.
-                context.completeLoad(moduleName);
-            };
-
-            //No need to continue if the plugin value has already been
-            //defined by a build.
-            if (fullName in defined) {
-                load(defined[fullName]);
-            } else {
-                //Use parentName here since the plugin's name is not reliable,
-                //could be some weird string with no path that actually wants to
-                //reference the parentName's path.
-                plugin.load(name, makeRequire(map.parentMap, true), load, config);
-            }
-        }
-
-        /**
-         * Adds the manager to the waiting queue. Only fully
-         * resolved items should be in the waiting queue.
-         */
-        function addWait(manager) {
-            if (!waiting[manager.id]) {
-                waiting[manager.id] = manager;
-                waitAry.push(manager);
-                context.waitCount += 1;
-            }
-        }
-
-        /**
-         * Function added to every manager object. Created out here
-         * to avoid new function creation for each manager instance.
-         */
-        function managerAdd(cb) {
-            this.listeners.push(cb);
-        }
-
-        function getManager(map, shouldQueue) {
-            var fullName = map.fullName,
-                prefix = map.prefix,
-                plugin = prefix ? plugins[prefix] ||
-                                (plugins[prefix] = defined[prefix]) : null,
-                manager, created, pluginManager;
-
-            if (fullName) {
-                manager = managerCallbacks[fullName];
-            }
-
-            if (!manager) {
-                created = true;
-                manager = {
-                    //ID is just the full name, but if it is a plugin resource
-                    //for a plugin that has not been loaded,
-                    //then add an ID counter to it.
-                    id: (prefix && !plugin ?
-                        (managerCounter++) + '__p@:' : '') +
-                        (fullName || '__r@' + (managerCounter++)),
-                    map: map,
-                    depCount: 0,
-                    depDone: [],
-                    depCallbacks: [],
-                    deps: [],
-                    listeners: [],
-                    add: managerAdd
-                };
-
-                specified[manager.id] = true;
-
-                //Only track the manager/reuse it if this is a non-plugin
-                //resource. Also only track plugin resources once
-                //the plugin has been loaded, and so the fullName is the
-                //true normalized value.
-                if (fullName && (!prefix || plugins[prefix])) {
-                    managerCallbacks[fullName] = manager;
-                }
-            }
-
-            //If there is a plugin needed, but it is not loaded,
-            //first load the plugin, then continue on.
-            if (prefix && !plugin) {
-                pluginManager = getManager(makeModuleMap(prefix), true);
-                pluginManager.add(function (plugin) {
-                    //Create a new manager for the normalized
-                    //resource ID and have it call this manager when
-                    //done.
-                    var newMap = makeModuleMap(map.originalName, map.parentMap),
-                        normalizedManager = getManager(newMap, true);
-
-                    //Indicate this manager is a placeholder for the real,
-                    //normalized thing. Important for when trying to map
-                    //modules and dependencies, for instance, in a build.
-                    manager.placeholder = true;
-
-                    normalizedManager.add(function (resource) {
-                        manager.callback = function () {
-                            return resource;
-                        };
-                        execManager(manager);
-                    });
-                });
-            } else if (created && shouldQueue) {
-                //Indicate the resource is not loaded yet if it is to be
-                //queued.
-                loaded[manager.id] = false;
-                queueDependency(manager);
-                addWait(manager);
-            }
-
-            return manager;
         }
 
         function main(inName, depArray, callback, relModuleMap) {
             var moduleMap = makeModuleMap(inName, relModuleMap),
                 name = moduleMap.name,
                 fullName = moduleMap.fullName,
-                manager = getManager(moduleMap),
-                id = manager.id,
-                deps = manager.deps,
-                i, depArg, depName, depPrefix, cjsMod;
+                uniques = {},
+                manager = {
+                    //Use a wait ID because some entries are anon
+                    //async require calls.
+                    waitId: name || reqWaitIdPrefix + (waitIdCounter++),
+                    depCount: 0,
+                    depMax: 0,
+                    prefix: moduleMap.prefix,
+                    name: name,
+                    fullName: fullName,
+                    deps: {},
+                    depArray: depArray,
+                    callback: callback,
+                    onDep: function (depName, value) {
+                        if (!(depName in manager.deps)) {
+                            manager.deps[depName] = value;
+                            manager.depCount += 1;
+                            if (manager.depCount === manager.depMax) {
+                                //All done, execute!
+                                execManager(manager);
+                            }
+                        }
+                    }
+                },
+                i, depArg, depName, cjsMod;
 
             if (fullName) {
                 //If module already defined for context, or already loaded,
                 //then leave. Also leave if jQuery is registering but it does
                 //not match the desired version number in the config.
-                if (fullName in defined || loaded[id] === true ||
+                if (fullName in defined || loaded[fullName] === true ||
                     (fullName === "jquery" && config.jQuery &&
                      config.jQuery !== callback().fn.jquery)) {
                     return;
@@ -813,21 +764,14 @@ var requirejs, require, define;
                 //as part of a layer, where onScriptLoad is not fired
                 //for those cases. Do this after the inline define and
                 //dependency tracing is done.
-                specified[id] = true;
-                loaded[id] = true;
+                specified[fullName] = true;
+                loaded[fullName] = true;
 
                 //If module is jQuery set up delaying its dom ready listeners.
                 if (fullName === "jquery" && callback) {
                     jQueryCheck(callback());
                 }
             }
-
-            //Attach real depArray and callback to the manager. Do this
-            //only if the module has not been defined already, so do this after
-            //the fullName checks above. IE can call main() more than once
-            //for a module.
-            manager.depArray = depArray;
-            manager.callback = callback;
 
             //Add the dependencies to the deps field, and register for callbacks
             //on the dependencies.
@@ -840,7 +784,6 @@ var requirejs, require, define;
                     //Split the dependency name into plugin and name parts
                     depArg = makeModuleMap(depArg, (name ? moduleMap : relModuleMap));
                     depName = depArg.fullName;
-                    depPrefix = depArg.prefix;
 
                     //Fix the name in depArray to be just the name, since
                     //that is how it will be called back later.
@@ -848,54 +791,46 @@ var requirejs, require, define;
 
                     //Fast path CommonJS standard dependencies.
                     if (depName === "require") {
-                        deps[i] = makeRequire(moduleMap);
+                        manager.deps[depName] = makeRequire(moduleMap);
                     } else if (depName === "exports") {
                         //CommonJS module spec 1.1
-                        deps[i] = defined[fullName] = {};
+                        manager.deps[depName] = defined[fullName] = {};
                         manager.usingExports = true;
                     } else if (depName === "module") {
                         //CommonJS module spec 1.1
-                        manager.cjsModule = cjsMod = deps[i] = {
+                        manager.cjsModule = cjsMod = manager.deps[depName] = {
                             id: name,
                             uri: name ? context.nameToUrl(name, null, relModuleMap) : undefined,
                             exports: defined[fullName]
                         };
-                    } else if (depName in defined && !(depName in waiting) &&
-                               (!(fullName in needFullExec) ||
-                                (fullName in needFullExec && fullExec[depName]))) {
-                        //Module already defined, and not in a build situation
-                        //where the module is a something that needs full
-                        //execution and this dependency has not been fully
-                        //executed. See r.js's requirePatch.js for more info
-                        //on fullExec.
-                        deps[i] = defined[depName];
-                    } else {
-                        //Mark this dependency as needing full exec if
-                        //the current module needs full exec.
-                        if (fullName in needFullExec) {
-                            needFullExec[depName] = true;
-                            //Reset state so fully executed code will get
-                            //picked up correctly.
-                            delete defined[depName];
-                            urlFetched[depArg.url] = false;
-                        }
+                        cjsMod.setExports = makeSetExports(cjsMod);
+                    } else if (depName in defined && !(depName in waiting)) {
+                        //Module already defined, no need to wait for it.
+                        manager.deps[depName] = defined[depName];
+                    } else if (!uniques[depName]) {
 
-                        //Either a resource that is not loaded yet, or a plugin
-                        //resource for either a plugin that has not
-                        //loaded yet.
-                        manager.depCount += 1;
-                        manager.depCallbacks[i] = makeArgCallback(manager, i);
-                        getManager(depArg, true).add(manager.depCallbacks[i]);
+                        //A dynamic dependency.
+                        manager.depMax += 1;
+
+                        queueDependency(depArg);
+
+                        //Register to get notification when dependency loads.
+                        (managerCallbacks[depName] ||
+                        (managerCallbacks[depName] = [])).push(manager);
+
+                        uniques[depName] = true;
                     }
                 }
             }
 
             //Do not bother tracking the manager if it is all done.
-            if (!manager.depCount) {
+            if (manager.depCount === manager.depMax) {
                 //All done, execute!
                 execManager(manager);
             } else {
-                addWait(manager);
+                waiting[manager.waitId] = manager;
+                waitAry.push(manager);
+                context.waitCount += 1;
             }
         }
 
@@ -905,6 +840,10 @@ var requirejs, require, define;
          */
         function callDefMain(args) {
             main.apply(null, args);
+            //Mark the module loaded. Must do it here in addition
+            //to doing it in define in case a script does
+            //not call define
+            loaded[args[0]] = true;
         }
 
         /**
@@ -953,10 +892,9 @@ var requirejs, require, define;
                 return undefined;
             }
 
-            var fullName = manager.map.fullName,
+            var fullName = manager.fullName,
                 depArray = manager.depArray,
-                i, depName, depManager, prefix, prefixManager, value;
-
+                depName, i;
             if (fullName) {
                 if (traced[fullName]) {
                     return defined[fullName];
@@ -965,24 +903,14 @@ var requirejs, require, define;
                 traced[fullName] = true;
             }
 
-            //Trace through the dependencies.
-            if (depArray) {
-                for (i = 0; i < depArray.length; i++) {
-                    //Some array members may be null, like if a trailing comma
-                    //IE, so do the explicit [i] access and check if it has a value.
-                    depName = depArray[i];
-                    if (depName) {
-                        //First, make sure if it is a plugin resource that the
-                        //plugin is not blocked.
-                        prefix = makeModuleMap(depName).prefix;
-                        if (prefix && (prefixManager = waiting[prefix])) {
-                            forceExec(prefixManager, traced);
-                        }
-                        depManager = waiting[depName];
-                        if (depManager && !depManager.isDone && loaded[depName]) {
-                            value = forceExec(depManager, traced);
-                            manager.depCallbacks[i](value);
-                        }
+            //forceExec all of its dependencies.
+            for (i = 0; i < depArray.length; i++) {
+                //Some array members may be null, like if a trailing comma
+                //IE, so do the explicit [i] access and check if it has a value.
+                depName = depArray[i];
+                if (depName) {
+                    if (!manager.deps[depName] && waiting[depName]) {
+                        manager.onDep(depName, forceExec(waiting[depName], traced));
                     }
                 }
             }
@@ -1076,11 +1004,6 @@ var requirejs, require, define;
                     forceExec(manager, {});
                 }
 
-                //If anything got placed in the paused queue, run it down.
-                if (context.paused.length) {
-                    resume();
-                }
-
                 //Only allow this recursion to a certain depth. Only
                 //triggered by errors in calling a module in which its
                 //modules waiting on it cannot finish loading, or some circular
@@ -1102,11 +1025,136 @@ var requirejs, require, define;
             return undefined;
         }
 
+        function callPlugin(pluginName, dep) {
+            var name = dep.name,
+                fullName = dep.fullName,
+                load;
+
+            //Do not bother if plugin is already defined or being loaded.
+            if (fullName in defined || fullName in loaded) {
+                return;
+            }
+
+            if (!plugins[pluginName]) {
+                plugins[pluginName] = defined[pluginName];
+            }
+
+            //Only set loaded to false for tracking if it has not already been set.
+            if (!loaded[fullName]) {
+                loaded[fullName] = false;
+            }
+
+            load = function (ret) {
+                //Allow the build process to register plugin-loaded dependencies.
+                if (req.onPluginLoad) {
+                    req.onPluginLoad(context, pluginName, name, ret);
+                }
+
+                execManager({
+                    prefix: dep.prefix,
+                    name: dep.name,
+                    fullName: dep.fullName,
+                    callback: function () {
+                        return ret;
+                    }
+                });
+                loaded[fullName] = true;
+            };
+
+            //Allow plugins to load other code without having to know the
+            //context or how to "complete" the load.
+            load.fromText = function (moduleName, text) {
+                /*jslint evil: true */
+                var hasInteractive = useInteractive;
+
+                //Indicate a the module is in process of loading.
+                context.loaded[moduleName] = false;
+                context.scriptCount += 1;
+
+                //Turn off interactive script matching for IE for any define
+                //calls in the text, then turn it back on at the end.
+                if (hasInteractive) {
+                    useInteractive = false;
+                }
+
+                req.exec(text);
+
+                if (hasInteractive) {
+                    useInteractive = true;
+                }
+
+                //Support anonymous modules.
+                context.completeLoad(moduleName);
+            };
+
+            //Use parentName here since the plugin's name is not reliable,
+            //could be some weird string with no path that actually wants to
+            //reference the parentName's path.
+            plugins[pluginName].load(name, makeRequire(dep.parentMap, true), load, config);
+        }
+
+        function loadPaused(dep) {
+            //Renormalize dependency if its name was waiting on a plugin
+            //to load, which as since loaded.
+            if (dep.prefix && dep.name && dep.name.indexOf('__$p') === 0 && defined[dep.prefix]) {
+                dep = makeModuleMap(dep.originalName, dep.parentMap);
+            }
+
+            var pluginName = dep.prefix,
+                fullName = dep.fullName,
+                urlFetched = context.urlFetched;
+
+            //Do not bother if the dependency has already been specified.
+            if (specified[fullName] || loaded[fullName]) {
+                return;
+            } else {
+                specified[fullName] = true;
+            }
+
+            if (pluginName) {
+                //If plugin not loaded, wait for it.
+                //set up callback list. if no list, then register
+                //managerCallback for that plugin.
+                if (defined[pluginName]) {
+                    callPlugin(pluginName, dep);
+                } else {
+                    if (!pluginsQueue[pluginName]) {
+                        pluginsQueue[pluginName] = [];
+                        (managerCallbacks[pluginName] ||
+                        (managerCallbacks[pluginName] = [])).push({
+                            onDep: function (name, value) {
+                                if (name === pluginName) {
+                                    var i, oldModuleMap, ary = pluginsQueue[pluginName];
+
+                                    //Now update all queued plugin actions.
+                                    for (i = 0; i < ary.length; i++) {
+                                        oldModuleMap = ary[i];
+                                        //Update the moduleMap since the
+                                        //module name may be normalized
+                                        //differently now.
+                                        callPlugin(pluginName,
+                                                   makeModuleMap(oldModuleMap.originalName, oldModuleMap.parentMap));
+                                    }
+                                    delete pluginsQueue[pluginName];
+                                }
+                            }
+                        });
+                    }
+                    pluginsQueue[pluginName].push(dep);
+                }
+            } else {
+                if (!urlFetched[dep.url]) {
+                    req.load(context, fullName, dep.url);
+                    urlFetched[dep.url] = true;
+                }
+            }
+        }
+
         /**
          * Resumes tracing of dependencies and then checks if everything is loaded.
          */
         resume = function () {
-            var manager, map, url, i, p, args, fullName;
+            var args, i, p;
 
             resumeDepth += 1;
 
@@ -1137,24 +1185,9 @@ var requirejs, require, define;
                     //Reset paused list
                     context.paused = [];
 
-                    for (i = 0; (manager = p[i]); i++) {
-                        map = manager.map;
-                        url = map.url;
-                        fullName = map.fullName;
-
-                        //If the manager is for a plugin managed resource,
-                        //ask the plugin to load it now.
-                        if (map.prefix) {
-                            callPlugin(map.prefix, manager);
-                        } else {
-                            //Regular dependency.
-                            if (!urlFetched[url] && !loaded[fullName]) {
-                                req.load(context, fullName, url);
-                                urlFetched[url] = true;
-                            }
-                        }
+                    for (i = 0; (args = p[i]); i++) {
+                        loadPaused(args);
                     }
-
                     //Move the start time for timeout forward.
                     context.startTime = (new Date()).getTime();
                     context.pausedCount -= p.length;
@@ -1186,15 +1219,12 @@ var requirejs, require, define;
             specified: specified,
             loaded: loaded,
             urlMap: urlMap,
-            urlFetched: urlFetched,
             scriptCount: 0,
+            urlFetched: {},
             defined: defined,
             paused: [],
             pausedCount: 0,
             plugins: plugins,
-            needFullExec: needFullExec,
-            fake: {},
-            fullExec: fullExec,
             managerCallbacks: managerCallbacks,
             makeModuleMap: makeModuleMap,
             normalize: normalize,
@@ -1260,6 +1290,7 @@ var requirejs, require, define;
                     //Allow tracing some require calls to allow the fetching
                     //of the priority config.
                     context.requireWait = false;
+
                     //But first, call resume to register any defined modules that may
                     //be in a data-main built file before the priority config
                     //call. Also grab any waiting define calls for this context.
@@ -1286,6 +1317,12 @@ var requirejs, require, define;
                 if (cfg.deps || cfg.callback) {
                     context.require(cfg.deps || [], cfg.callback);
                 }
+
+                //Set up ready callback, if asked. Useful when require is defined as a
+                //config object before require.js is loaded.
+                if (cfg.ready) {
+                    req.ready(cfg.ready);
+                }
             },
 
             requireDefined: function (moduleName, relModuleMap) {
@@ -1299,11 +1336,6 @@ var requirejs, require, define;
             require: function (deps, callback, relModuleMap) {
                 var moduleName, fullName, moduleMap;
                 if (typeof deps === "string") {
-                    if (isFunction(callback)) {
-                        //Invalid call
-                        return req.onError(makeError("requireargs", "Invalid require call"));
-                    }
-
                     //Synchronous access to one module. If require.get is
                     //available (as in the Node adapter), prefer that.
                     //In this case deps is the moduleName and callback is
@@ -1330,11 +1362,7 @@ var requirejs, require, define;
                     return defined[fullName];
                 }
 
-                //Call main but only if there are dependencies or
-                //a callback to call.
-                if (deps && deps.length || callback) {
-                    main(null, deps, callback, relModuleMap);
-                }
+                main(null, deps, callback, relModuleMap);
 
                 //If the require call does not trigger anything new to load,
                 //then resume the dependency processing.
@@ -1404,6 +1432,11 @@ var requirejs, require, define;
                                     return jQuery;
                                 } : null]);
                 }
+
+                //Mark the script as loaded. Note that this can be different from a
+                //moduleName that maps to a define call. This line is important
+                //for traditional browser scripts.
+                loaded[moduleName] = true;
 
                 //If a global jQuery is defined, check for it. Need to do it here
                 //instead of main() since stock jQuery does not register as
@@ -1565,7 +1598,7 @@ var requirejs, require, define;
     /**
      * Export require as a global, but only if it does not already exist.
      */
-    if (!require) {
+    if (typeof require === "undefined") {
         require = req;
     }
 
@@ -1578,13 +1611,17 @@ var requirejs, require, define;
     };
 
     req.version = version;
-
+    req.isArray = isArray;
+    req.isFunction = isFunction;
+    req.mixin = mixin;
     //Used to filter out dependencies that are already paths.
     req.jsExtRegExp = /^\/|:|\?|\.js$/;
     s = req.s = {
         contexts: contexts,
         //Stores a list of URLs that should not get async script tag treatment.
-        skipAsync: {}
+        skipAsync: {},
+        isPageLoaded: !isBrowser,
+        readyCalls: []
     };
 
     req.isAsync = req.isBrowser = isBrowser;
@@ -1618,7 +1655,14 @@ var requirejs, require, define;
      * @param {Object} url the URL to the module.
      */
     req.load = function (context, moduleName, url) {
-        req.resourcesReady(false);
+        var loaded = context.loaded;
+
+        isDone = false;
+
+        //Only set loaded to false for tracking if it has not already been set.
+        if (!loaded[moduleName]) {
+            loaded[moduleName] = false;
+        }
 
         context.scriptCount += 1;
         req.attach(url, context, moduleName);
@@ -1655,7 +1699,7 @@ var requirejs, require, define;
      * return a value to define the module corresponding to the first argument's
      * name.
      */
-    define = function (name, deps, callback) {
+    define = req.def = function (name, deps, callback) {
         var node, context;
 
         //Allow for anonymous functions
@@ -1667,14 +1711,14 @@ var requirejs, require, define;
         }
 
         //This module may not have dependencies
-        if (!isArray(deps)) {
+        if (!req.isArray(deps)) {
             callback = deps;
             deps = [];
         }
 
         //If no name, and callback is a function, then figure out if it a
         //CommonJS thing with dependencies.
-        if (!deps.length && isFunction(callback)) {
+        if (!name && !deps.length && req.isFunction(callback)) {
             //Remove comments from the callback string,
             //look for require calls, and pull them into the dependencies,
             //but only if there are function args.
@@ -1744,25 +1788,6 @@ var requirejs, require, define;
         return callback.apply(exports, args);
     };
 
-
-    /**
-     * Adds a node to the DOM. Public function since used by the order plugin.
-     * This method should not normally be called by outside code.
-     */
-    req.addScriptToDom = function (node) {
-        //For some cache cases in IE 6-8, the script executes before the end
-        //of the appendChild execution, so to tie an anonymous define
-        //call to the module name (which is stored on the node), hold on
-        //to a reference to this node, but clear after the DOM insertion.
-        currentlyAddingScript = node;
-        if (baseElement) {
-            head.insertBefore(node, baseElement);
-        } else {
-            head.appendChild(node);
-        }
-        currentlyAddingScript = null;
-    };
-
     /**
      * callback for script loads, used to check status of loading.
      *
@@ -1778,7 +1803,7 @@ var requirejs, require, define;
         var node = evt.currentTarget || evt.srcElement, contextName, moduleName,
             context;
 
-        if (evt.type === "load" || (node && readyRegExp.test(node.readyState))) {
+        if (evt.type === "load" || readyRegExp.test(node.readyState)) {
             //Reset interactive script so a script node is not held onto for
             //to long.
             interactiveScript = null;
@@ -1812,14 +1837,9 @@ var requirejs, require, define;
      * @param {moduleName} the name of the module that is associated with the script.
      * @param {Function} [callback] optional callback, defaults to require.onScriptLoad
      * @param {String} [type] optional type, defaults to text/javascript
-     * @param {Function} [fetchOnlyFunction] optional function to indicate the script node
-     * should be set up to fetch the script but do not attach it to the DOM
-     * so that it can later be attached to execute it. This is a way for the
-     * order plugin to support ordered loading in IE. Once the script is fetched,
-     * but not executed, the fetchOnlyFunction will be called.
      */
-    req.attach = function (url, context, moduleName, callback, type, fetchOnlyFunction) {
-        var node;
+    req.attach = function (url, context, moduleName, callback, type) {
+        var node, loaded;
         if (isBrowser) {
             //In the browser so use a script tag
             callback = callback || req.onScriptLoad;
@@ -1860,36 +1880,23 @@ var requirejs, require, define;
                 //However, IE reports the script as being in "interactive"
                 //readyState at the time of the define call.
                 useInteractive = true;
-
-
-                if (fetchOnlyFunction) {
-                    //Need to use old school onreadystate here since
-                    //when the event fires and the node is not attached
-                    //to the DOM, the evt.srcElement is null, so use
-                    //a closure to remember the node.
-                    node.onreadystatechange = function (evt) {
-                        //Script loaded but not executed.
-                        //Clear loaded handler, set the real one that
-                        //waits for script execution.
-                        if (node.readyState === 'loaded') {
-                            node.onreadystatechange = null;
-                            node.attachEvent("onreadystatechange", callback);
-                            fetchOnlyFunction(node);
-                        }
-                    };
-                } else {
-                    node.attachEvent("onreadystatechange", callback);
-                }
+                node.attachEvent("onreadystatechange", callback);
             } else {
                 node.addEventListener("load", callback, false);
             }
             node.src = url;
 
-            //Fetch only means waiting to attach to DOM after loaded.
-            if (!fetchOnlyFunction) {
-                req.addScriptToDom(node);
+            //For some cache cases in IE 6-8, the script executes before the end
+            //of the appendChild execution, so to tie an anonymous define
+            //call to the module name (which is stored on the node), hold on
+            //to a reference to this node, but clear after the DOM insertion.
+            currentlyAddingScript = node;
+            if (baseElement) {
+                head.insertBefore(node, baseElement);
+            } else {
+                head.appendChild(node);
             }
-
+            currentlyAddingScript = null;
             return node;
         } else if (isWebWorker) {
             //In a web worker, use importScripts. This is not a very
@@ -1898,6 +1905,9 @@ var requirejs, require, define;
             //are in play, the expectation that a build has been done so that
             //only one script needs to be loaded anyway. This may need to be
             //reevaluated if other use cases become common.
+            loaded = context.loaded;
+            loaded[moduleName] = false;
+
             importScripts(url);
 
             //Account for anonymous modules
@@ -1944,8 +1954,36 @@ var requirejs, require, define;
         }
     }
 
+    //Set baseUrl based on config.
+    s.baseUrl = cfg.baseUrl;
+
+    //****** START page load functionality ****************
+    /**
+     * Sets the page as loaded and triggers check for all modules loaded.
+     */
+    req.pageLoaded = function () {
+        if (!s.isPageLoaded) {
+            s.isPageLoaded = true;
+            if (scrollIntervalId) {
+                clearInterval(scrollIntervalId);
+            }
+
+            //Part of a fix for FF < 3.6 where readyState was not set to
+            //complete so libraries like jQuery that check for readyState
+            //after page load where not getting initialized correctly.
+            //Original approach suggested by Andrea Giammarchi:
+            //http://webreflection.blogspot.com/2009/11/195-chars-to-help-lazy-loading.html
+            //see other setReadyState reference for the rest of the fix.
+            if (setReadyState) {
+                document.readyState = "complete";
+            }
+
+            req.callReady();
+        }
+    };
+
     //See if there is nothing waiting across contexts, and if not, trigger
-    //resourcesReady.
+    //callReady.
     req.checkReadyState = function () {
         var contexts = s.contexts, prop;
         for (prop in contexts) {
@@ -1955,22 +1993,26 @@ var requirejs, require, define;
                 }
             }
         }
-        req.resourcesReady(true);
+        s.isDone = true;
+        req.callReady();
     };
 
     /**
-     * Internal function that is triggered whenever all scripts/resources
-     * have been loaded by the loader. Can be overridden by other, for
-     * instance the domReady plugin, which wants to know when all resources
-     * are loaded.
+     * Internal function that calls back any ready functions. If you are
+     * integrating RequireJS with another library without require.ready support,
+     * you can define this method to call your page ready code instead.
      */
-    req.resourcesReady = function (isReady) {
-        var contexts, context, prop;
+    req.callReady = function () {
+        var callbacks = s.readyCalls, i, callback, contexts, context, prop;
 
-        //First, set the public variable indicating that resources are loading.
-        req.resourcesDone = isReady;
+        if (s.isPageLoaded && s.isDone) {
+            if (callbacks.length) {
+                s.readyCalls = [];
+                for (i = 0; (callback = callbacks[i]); i++) {
+                    callback();
+                }
+            }
 
-        if (req.resourcesDone) {
             //If jQuery with DOM ready delayed, release it now.
             contexts = s.contexts;
             for (prop in contexts) {
@@ -1985,23 +2027,62 @@ var requirejs, require, define;
         }
     };
 
-    //FF < 3.6 readyState fix. Needed so that domReady plugin
-    //works well in that environment, since require.js is normally
-    //loaded via an HTML script tag so it will be there before window load,
-    //where the domReady plugin is more likely to be loaded after window load.
-    req.pageLoaded = function () {
-        if (document.readyState !== "complete") {
-            document.readyState = "complete";
+    /**
+     * Registers functions to call when the page is loaded
+     */
+    req.ready = function (callback) {
+        if (s.isPageLoaded && s.isDone) {
+            callback();
+        } else {
+            s.readyCalls.push(callback);
         }
+        return req;
     };
+
     if (isBrowser) {
         if (document.addEventListener) {
+            //Standards. Hooray! Assumption here that if standards based,
+            //it knows about DOMContentLoaded.
+            document.addEventListener("DOMContentLoaded", req.pageLoaded, false);
+            window.addEventListener("load", req.pageLoaded, false);
+            //Part of FF < 3.6 readystate fix (see setReadyState refs for more info)
             if (!document.readyState) {
+                setReadyState = true;
                 document.readyState = "loading";
-                window.addEventListener("load", req.pageLoaded, false);
+            }
+        } else if (window.attachEvent) {
+            window.attachEvent("onload", req.pageLoaded);
+
+            //DOMContentLoaded approximation, as found by Diego Perini:
+            //http://javascript.nwbox.com/IEContentLoaded/
+            if (self === self.top) {
+                scrollIntervalId = setInterval(function () {
+                    try {
+                        //From this ticket:
+                        //http://bugs.dojotoolkit.org/ticket/11106,
+                        //In IE HTML Application (HTA), such as in a selenium test,
+                        //javascript in the iframe can't see anything outside
+                        //of it, so self===self.top is true, but the iframe is
+                        //not the top window and doScroll will be available
+                        //before document.body is set. Test document.body
+                        //before trying the doScroll trick.
+                        if (document.body) {
+                            document.documentElement.doScroll("left");
+                            req.pageLoaded();
+                        }
+                    } catch (e) {}
+                }, 30);
             }
         }
+
+        //Check if document already complete, and if so, just trigger page load
+        //listeners. NOTE: does not work with Firefox before 3.6. To support
+        //those browsers, manually call require.pageLoaded().
+        if (document.readyState === "complete") {
+            req.pageLoaded();
+        }
     }
+    //****** END page load functionality ****************
 
     //Set up default context. If require was a configuration object, use that as base config.
     req(cfg);
@@ -2049,7 +2130,11 @@ var requirejs, require, define;
 (function () {
 
     require.load = function (context, moduleName, url) {
+        //isDone is used by require.ready()
+        require.s.isDone = false;
+
         //Indicate a the module is in process of loading.
+        context.loaded[moduleName] = false;
         context.scriptCount += 1;
 
         load(url);
@@ -2062,7 +2147,6 @@ var requirejs, require, define;
     } else if (env === 'node') {
         this.requirejsVars = {
             require: require,
-            requirejs: require,
             define: define,
             nodeRequire: nodeRequire
         };
@@ -2122,15 +2206,19 @@ var requirejs, require, define;
     //API instead of the Node API, and it is done lexically so
     //that it survives later execution.
     req.makeNodeWrapper = function (contents) {
-        return '(function (require, requirejs, define) { ' +
+        return '(function (require, define) { ' +
                 contents +
-                '\n}(requirejsVars.require, requirejsVars.requirejs, requirejsVars.define));';
+                '\n}(requirejsVars.require, requirejsVars.define));';
     };
 
     req.load = function (context, moduleName, url) {
         var contents, err;
 
+        //isDone is used by require.ready()
+        req.s.isDone = false;
+
         //Indicate a the module is in process of loading.
+        context.loaded[moduleName] = false;
         context.scriptCount += 1;
 
         if (path.existsSync(url)) {
@@ -2150,7 +2238,7 @@ var requirejs, require, define;
         } else {
             def(moduleName, function () {
                 try {
-                    return (context.config.nodeRequire || req.nodeRequire)(moduleName);
+                    return nodeReq(moduleName);
                 } catch (e) {
                     err = new Error('Calling node\'s require("' +
                                         moduleName + '") failed with error: ' + e);
@@ -2330,33 +2418,12 @@ if(env === 'node') {
  */
 
 /*jslint plusplus: false, octal:false, strict: false */
-/*global define: false, process: false */
+/*global define: false */
 
 define('node/file', ['fs', 'path'], function (fs, path) {
 
-    var isWindows = process.platform === 'win32',
-        file;
-
-    function frontSlash(path) {
-        return path.replace(/\\/g, '/');
-    }
-
-    function exists(path) {
-        if (isWindows && path.charAt(path.length - 1) === '/' &&
-            path.charAt(path.length - 2) !== ':') {
-            path = path.substring(0, path.length - 1);
-        }
-
-        try {
-            fs.statSync(path);
-            return true;
-        } catch (e) {
-            return false;
-        }
-    }
-
     function mkDir(dir) {
-        if (!exists(dir)) {
+        if (!path.existsSync(dir)) {
             fs.mkdirSync(dir, 0777);
         }
     }
@@ -2365,7 +2432,6 @@ define('node/file', ['fs', 'path'], function (fs, path) {
         var parts = dir.split('/'),
             currDir = '',
             first = true;
-
         parts.forEach(function (part) {
             //First part may be empty string if path starts with a slash.
             currDir += part + '/';
@@ -2377,15 +2443,14 @@ define('node/file', ['fs', 'path'], function (fs, path) {
         });
     }
 
-    file = {
+    var file = {
         backSlashRegExp: /\\/g,
-        dirExclusionRegExp: /^\./,
         getLineSeparator: function () {
             return '/';
         },
 
         exists: function (fileName) {
-            return exists(fileName);
+            return path.existsSync(fileName);
         },
 
         parent: function (fileName) {
@@ -2400,11 +2465,11 @@ define('node/file', ['fs', 'path'], function (fs, path) {
          * @param {String} fileName
          */
         absPath: function (fileName) {
-            return frontSlash(path.normalize(frontSlash(fs.realpathSync(fileName))));
+            return path.normalize(fs.realpathSync(fileName).replace(/\\/g, '/'));
         },
 
         normalize: function (fileName) {
-            return frontSlash(path.normalize(fileName));
+            return path.normalize(fileName);
         },
 
         isFile: function (path) {
@@ -2428,7 +2493,7 @@ define('node/file', ['fs', 'path'], function (fs, path) {
             regExpInclude = regExpFilters.include || regExpFilters;
             regExpExclude = regExpFilters.exclude || null;
 
-            if (file.exists(topDir)) {
+            if (path.existsSync(topDir)) {
                 dirFileArray = fs.readdirSync(topDir);
                 for (i = 0; i < dirFileArray.length; i++) {
                     fileName = dirFileArray[i];
@@ -2438,7 +2503,7 @@ define('node/file', ['fs', 'path'], function (fs, path) {
                         if (makeUnixPaths) {
                             //Make sure we have a JS string.
                             if (filePath.indexOf("/") === -1) {
-                                filePath = frontSlash(filePath);
+                                filePath = filePath.replace(/\\/g, "/");
                             }
                         }
 
@@ -2453,8 +2518,7 @@ define('node/file', ['fs', 'path'], function (fs, path) {
                         if (ok && !fileName.match(/^\./)) {
                             files.push(filePath);
                         }
-                    } else if (stat.isDirectory() &&
-                              (!file.dirExclusionRegExp || !fileName.match(file.dirExclusionRegExp))) {
+                    } else if (stat.isDirectory() && !fileName.match(/^\./)) {
                         dirFiles = this.getFilteredFileList(filePath, regExpFilters, makeUnixPaths);
                         files.push.apply(files, dirFiles);
                     }
@@ -2468,11 +2532,6 @@ define('node/file', ['fs', 'path'], function (fs, path) {
             //summary: copies files from srcDir to destDir using the regExpFilter to determine if the
             //file should be copied. Returns a list file name strings of the destinations that were copied.
             regExpFilter = regExpFilter || /\w/;
-
-            //Normalize th directory names, but keep front slashes.
-            //path module on windows now returns backslashed paths.
-            srcDir = frontSlash(path.normalize(srcDir));
-            destDir = frontSlash(path.normalize(destDir));
 
             var fileNames = file.getFilteredFileList(srcDir, regExpFilter, true),
             copiedFiles = [], i, srcFileName, destFileName;
@@ -2500,19 +2559,18 @@ define('node/file', ['fs', 'path'], function (fs, path) {
             //If onlyCopyNew is true, then compare dates and only copy if the src is newer
             //than dest.
             if (onlyCopyNew) {
-                if (file.exists(destFileName) && fs.statSync(destFileName).mtime.getTime() >= fs.statSync(srcFileName).mtime.getTime()) {
+                if (path.existsSync(destFileName) && fs.statSync(destFileName).mtime.getTime() >= fs.statSync(srcFileName).mtime.getTime()) {
                     return false; //Boolean
                 }
             }
 
             //Make sure destination dir exists.
             parentDir = path.dirname(destFileName);
-            if (!file.exists(parentDir)) {
+            if (!path.existsSync(parentDir)) {
                 mkFullDir(parentDir);
             }
 
             fs.writeFileSync(destFileName, fs.readFileSync(srcFileName, 'binary'), 'binary');
-
             return true; //Boolean
         },
 
@@ -2527,15 +2585,7 @@ define('node/file', ['fs', 'path'], function (fs, path) {
                 encoding = 'utf8';
             }
 
-            var text = fs.readFileSync(path, encoding);
-
-            //Hmm, would not expect to get A BOM, but it seems to happen,
-            //remove it just in case.
-            if (text.indexOf('\uFEFF') === 0) {
-                text = text.substring(1, text.length);
-            }
-
-            return text;
+            return fs.readFileSync(path, encoding);
         },
 
         saveUtf8File: function (/*String*/fileName, /*String*/fileContents) {
@@ -2556,7 +2606,7 @@ define('node/file', ['fs', 'path'], function (fs, path) {
 
             //Make sure destination directories exist.
             parentDir = path.dirname(fileName);
-            if (!file.exists(parentDir)) {
+            if (!path.existsSync(parentDir)) {
                 mkFullDir(parentDir);
             }
 
@@ -2566,7 +2616,7 @@ define('node/file', ['fs', 'path'], function (fs, path) {
         deleteFile: function (/*String*/fileName) {
             //summary: deletes a file or directory if it exists.
             var files, i, stat;
-            if (file.exists(fileName)) {
+            if (path.existsSync(fileName)) {
                 stat = fs.statSync(fileName);
                 if (stat.isDirectory()) {
                     files = fs.readdirSync(fileName);
@@ -2601,8 +2651,6 @@ if(env === 'rhino') {
 define('rhino/file', function () {
     var file = {
         backSlashRegExp: /\\/g,
-
-        dirExclusionRegExp: /^\./,
 
         getLineSeparator: function () {
             return file.lineSeparator;
@@ -2683,8 +2731,7 @@ define('rhino/file', function () {
                         if (ok && !fileObj.getName().match(/^\./)) {
                             files.push(filePath);
                         }
-                    } else if (fileObj.isDirectory() &&
-                              (!file.dirExclusionRegExp || !fileObj.getName().match(file.dirExclusionRegExp))) {
+                    } else if (fileObj.isDirectory() && !fileObj.getName().match(/^\./)) {
                         dirFiles = this.getFilteredFileList(fileObj, regExpFilters, makeUnixPaths, true);
                         files.push.apply(files, dirFiles);
                     }
@@ -2932,7 +2979,6 @@ define('logger', ['env!env/print'], function (print) {
         INFO: 1,
         WARN: 2,
         ERROR: 3,
-        SILENT: 4,
         level: 0,
         logPrefix: "",
 
@@ -3176,7 +3222,7 @@ var OPERATORS = array_to_hash([
         "||"
 ]);
 
-var WHITESPACE_CHARS = array_to_hash(characters(" \u00a0\n\r\t\f\u000b\u200b\u180e\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u202f\u205f\u3000"));
+var WHITESPACE_CHARS = array_to_hash(characters(" \u00a0\n\r\t\f\v\u200b"));
 
 var PUNC_BEFORE_EXPRESSION = array_to_hash(characters("[{}(,.;:"));
 
@@ -3244,7 +3290,13 @@ function JS_Parse_Error(message, line, col, pos) {
         this.line = line;
         this.col = col;
         this.pos = pos;
-        this.stack = new Error().stack;
+        /*
+        try {
+                ({})();
+        } catch(ex) {
+                this.stack = ex.stack;
+        };
+        */
 };
 
 JS_Parse_Error.prototype.toString = function() {
@@ -3387,12 +3439,11 @@ function tokenizer($TEXT) {
                     case "r" : return "\r";
                     case "t" : return "\t";
                     case "b" : return "\b";
-                    case "v" : return "\u000b";
+                    case "v" : return "\v";
                     case "f" : return "\f";
                     case "0" : return "\0";
                     case "x" : return String.fromCharCode(hex_bytes(2));
                     case "u" : return String.fromCharCode(hex_bytes(4));
-                    case "\n": return "";
                     default  : return ch;
                 }
         };
@@ -3491,9 +3542,9 @@ function tokenizer($TEXT) {
                 return name;
         };
 
-        function read_regexp(regexp) {
+        function read_regexp() {
                 return with_eof_error("Unterminated regular expression", function(){
-                        var prev_backslash = false, ch, in_class = false;
+                        var prev_backslash = false, regexp = "", ch, in_class = false;
                         while ((ch = next(true))) if (prev_backslash) {
                                 regexp += "\\" + ch;
                                 prev_backslash = false;
@@ -3542,7 +3593,7 @@ function tokenizer($TEXT) {
                         S.regex_allowed = regex_allowed;
                         return next_token();
                 }
-                return S.regex_allowed ? read_regexp("") : read_operator("/");
+                return S.regex_allowed ? read_regexp() : read_operator("/");
         };
 
         function handle_dot() {
@@ -3573,8 +3624,8 @@ function tokenizer($TEXT) {
         };
 
         function next_token(force_regexp) {
-                if (force_regexp != null)
-                        return read_regexp(force_regexp);
+                if (force_regexp)
+                        return read_regexp();
                 skip_whitespace();
                 start_token();
                 var ch = peek();
@@ -3763,9 +3814,9 @@ function parse($TEXT, exigent_mode, embed_tokens) {
         };
 
         var statement = maybe_embed_tokens(function() {
-                if (is("operator", "/") || is("operator", "/=")) {
+                if (is("operator", "/")) {
                         S.peeked = null;
-                        S.token = S.input(S.token.value.substr(1)); // force regexp
+                        S.token = S.input(true); // force regexp
                 }
                 switch (S.token.type) {
                     case "num":
@@ -3835,8 +3886,6 @@ function parse($TEXT, exigent_mode, embed_tokens) {
                                 return as("switch", parenthesised(), switch_block_());
 
                             case "throw":
-                                if (S.token.nlb)
-                                        croak("Illegal newline after 'throw'");
                                 return as("throw", prog1(expression, semicolon));
 
                             case "try":
@@ -4212,7 +4261,7 @@ function parse($TEXT, exigent_mode, embed_tokens) {
 
         function is_assignable(expr) {
                 if (!exigent_mode) return true;
-                switch (expr[0]+"") {
+                switch (expr[0]) {
                     case "dot":
                     case "sub":
                     case "new":
@@ -4286,7 +4335,7 @@ function array_to_hash(a) {
 };
 
 function slice(a, start) {
-        return Array.prototype.slice.call(a, start || 0);
+        return Array.prototype.slice.call(a, start == null ? 0 : start);
 };
 
 function characters(str) {
@@ -4325,55 +4374,28 @@ exports.set_logger = function(logger) {
         warn = logger;
 };
 
-});define('uglifyjs/squeeze-more', ["require", "exports", "module", "./parse-js", "./process"], function(require, exports, module) {
+
+});
+define('uglifyjs/squeeze-more', ["require", "exports", "module", "./parse-js", "./process"], function(require, exports, module) {
 
 var jsp = require("./parse-js"),
     pro = require("./process"),
     slice = jsp.slice,
     member = jsp.member,
-    curry = jsp.curry,
-    MAP = pro.MAP,
     PRECEDENCE = jsp.PRECEDENCE,
     OPERATORS = jsp.OPERATORS;
 
 function ast_squeeze_more(ast) {
-        var w = pro.ast_walker(), walk = w.walk, scope;
-        function with_scope(s, cont) {
-                var save = scope, ret;
-                scope = s;
-                ret = cont();
-                scope = save;
-                return ret;
-        };
-        function _lambda(name, args, body) {
-                return [ this[0], name, args, with_scope(body.scope, curry(MAP, body, walk)) ];
-        };
+        var w = pro.ast_walker(), walk = w.walk;
         return w.with_walkers({
-                "toplevel": function(body) {
-                        return [ this[0], with_scope(this.scope, curry(MAP, body, walk)) ];
-                },
-                "function": _lambda,
-                "defun": _lambda,
-                "new": function(ctor, args) {
-                        if (ctor[0] == "name" && ctor[1] == "Array" && !scope.has("Array")) {
-                                if (args.length != 1) {
-                                        return [ "array", args ];
-                                } else {
-                                        return walk([ "call", [ "name", "Array" ], args ]);
-                                }
-                        }
-                },
                 "call": function(expr, args) {
                         if (expr[0] == "dot" && expr[2] == "toString" && args.length == 0) {
                                 // foo.toString()  ==>  foo+""
                                 return [ "binary", "+", expr[1], [ "string", "" ]];
                         }
-                        if (expr[0] == "name" && expr[1] == "Array" && args.length != 1 && !scope.has("Array")) {
-                                return [ "array", args ];
-                        }
                 }
         }, function() {
-                return walk(pro.ast_add_scope(ast));
+                return walk(ast);
         });
 };
 
@@ -4449,7 +4471,7 @@ var jsp = require("./parse-js"),
 
 /* -----[ helper for AST traversal ]----- */
 
-function ast_walker() {
+function ast_walker(ast) {
         function _vardefs(defs) {
                 return [ this[0], MAP(defs, function(def){
                         var a = [ def[0] ];
@@ -4606,17 +4628,6 @@ function ast_walker() {
                 }
         };
 
-        function dive(ast) {
-                if (ast == null)
-                        return null;
-                try {
-                        stack.push(ast);
-                        return walkers[ast[0]].apply(ast, ast.slice(1));
-                } finally {
-                        stack.pop();
-                }
-        };
-
         function with_walkers(walkers, cont){
                 var save = {}, i;
                 for (i in walkers) if (HOP(walkers, i)) {
@@ -4633,7 +4644,6 @@ function ast_walker() {
 
         return {
                 walk: walk,
-                dive: dive,
                 with_walkers: with_walkers,
                 parent: function() {
                         return stack[stack.length - 2]; // last one is current node
@@ -4746,15 +4756,9 @@ Scope.prototype = {
                 if (!newMangle) return name;                      // not found and no mangling requested
                 return s.set_mangle(name, s.next_mangled());
         },
-        references: function(name) {
-                return name && !this.parent || this.uses_with || this.uses_eval || this.refs[name];
-        },
-        define: function(name, type) {
-                if (name != null) {
-                        if (type == "var" || !HOP(this.names, name))
-                                this.names[name] = type || "var";
-                        return name;
-                }
+        define: function(name) {
+                if (name != null)
+                        return this.names[name] = name;
         }
 };
 
@@ -4772,8 +4776,8 @@ function ast_add_scope(ast) {
                 return ret;
         };
 
-        function define(name, type) {
-                return current_scope.define(name, type);
+        function define(name) {
+                return current_scope.define(name);
         };
 
         function reference(name) {
@@ -4782,20 +4786,11 @@ function ast_add_scope(ast) {
 
         function _lambda(name, args, body) {
                 var is_defun = this[0] == "defun";
-                return [ this[0], is_defun ? define(name, "defun") : name, args, with_new_scope(function(){
-                        if (!is_defun) define(name, "lambda");
-                        MAP(args, function(name){ define(name, "arg") });
+                return [ this[0], is_defun ? define(name) : name, args, with_new_scope(function(){
+                        if (!is_defun) define(name);
+                        MAP(args, define);
                         return MAP(body, walk);
                 })];
-        };
-
-        function _vardefs(type) {
-                return function(defs) {
-                        MAP(defs, function(d){
-                                define(d[0], type);
-                                if (d[1]) reference(d[0]);
-                        });
-                };
         };
 
         return with_new_scope(function(){
@@ -4803,20 +4798,21 @@ function ast_add_scope(ast) {
                 var ret = w.with_walkers({
                         "function": _lambda,
                         "defun": _lambda,
-                        "label": function(name, stat) { define(name, "label") },
-                        "break": function(label) { if (label) reference(label) },
-                        "continue": function(label) { if (label) reference(label) },
                         "with": function(expr, block) {
                                 for (var s = current_scope; s; s = s.parent)
                                         s.uses_with = true;
                         },
-                        "var": _vardefs("var"),
-                        "const": _vardefs("const"),
+                        "var": function(defs) {
+                                MAP(defs, function(d){ define(d[0]) });
+                        },
+                        "const": function(defs) {
+                                MAP(defs, function(d){ define(d[0]) });
+                        },
                         "try": function(t, c, f) {
                                 if (c != null) return [
                                         this[0],
                                         MAP(t, walk),
-                                        [ define(c[0], "catch"), MAP(c[1], walk) ],
+                                        [ define(c[0]), MAP(c[1], walk) ],
                                         f != null ? MAP(f, walk) : null
                                 ];
                         },
@@ -4944,9 +4940,6 @@ function ast_mangle(ast, options) {
                         }
                         return ast;
                 },
-                "label": function(label, stat) { return [ this[0], get_mangled(label), walk(stat) ] },
-                "break": function(label) { if (label) return [ this[0], get_mangled(label) ] },
-                "continue": function(label) { if (label) return [ this[0], get_mangled(label) ] },
                 "var": _vardefs,
                 "const": _vardefs,
                 "name": function(name) {
@@ -4993,12 +4986,10 @@ function last_stat(b) {
 }
 
 function aborts(t) {
-        if (t) switch (last_stat(t)[0]) {
-            case "return":
-            case "break":
-            case "continue":
-            case "throw":
-                return true;
+        if (t) {
+                t = last_stat(t);
+                if (t[0] == "return" || t[0] == "break" || t[0] == "continue" || t[0] == "throw")
+                        return true;
         }
 };
 
@@ -5025,6 +5016,21 @@ function boolean_expr(expr) {
                  (expr[0] == "seq"
                   && boolean_expr(expr[expr.length - 1]))
                );
+};
+
+function make_conditional(c, t, e) {
+    var make_real_conditional = function() {
+        if (c[0] == "unary-prefix" && c[1] == "!") {
+            return e ? [ "conditional", c[2], e, t ] : [ "binary", "||", c[2], t ];
+        } else {
+            return e ? [ "conditional", c, t, e ] : [ "binary", "&&", c, t ];
+        }
+    };
+    // shortcut the conditional if the expression has a constant value
+    return when_constant(c, function(ast, val){
+        warn_unreachable(val ? e : t);
+        return          (val ? t : e);
+    }, make_real_conditional);
 };
 
 function empty(b) {
@@ -5054,7 +5060,6 @@ var when_constant = (function(){
                         switch (expr[1]) {
                             case "true": return true;
                             case "false": return false;
-                            case "null": return null;
                         }
                         break;
                     case "unary-prefix":
@@ -5077,7 +5082,6 @@ var when_constant = (function(){
                             case "+"          : return evaluate(left) +          evaluate(right);
                             case "*"          : return evaluate(left) *          evaluate(right);
                             case "/"          : return evaluate(left) /          evaluate(right);
-                            case "%"          : return evaluate(left) %          evaluate(right);
                             case "-"          : return evaluate(left) -          evaluate(right);
                             case "<<"         : return evaluate(left) <<         evaluate(right);
                             case ">>"         : return evaluate(left) >>         evaluate(right);
@@ -5174,7 +5178,9 @@ function prepare_ifs(ast) {
                         var conditional = walk(fi[1]);
 
                         var e_body = statements.slice(i + 1);
-                        var e = e_body.length == 1 ? e_body[0] : [ "block", e_body ];
+                        var e;
+                        if (e_body.length == 1) e = e_body[0];
+                        else e = [ "block", e_body ];
 
                         var ret = statements.slice(0, i).concat([ [
                                 fi[0],          // "if"
@@ -5191,11 +5197,14 @@ function prepare_ifs(ast) {
 
         function redo_if_lambda(name, args, body) {
                 body = redo_if(body);
-                return [ this[0], name, args, body ];
+                return [ this[0], name, args.slice(), body ];
         };
 
         function redo_if_block(statements) {
-                return [ this[0], statements != null ? redo_if(statements) : null ];
+                var out = [ this[0] ];
+                if (statements != null)
+                        out.push(redo_if(statements));
+                return out;
         };
 
         return w.with_walkers({
@@ -5219,143 +5228,11 @@ function prepare_ifs(ast) {
         });
 };
 
-function for_side_effects(ast, handler) {
-        var w = ast_walker(), walk = w.walk;
-        var $stop = {}, $restart = {};
-        function stop() { throw $stop };
-        function restart() { throw $restart };
-        function found(){ return handler.call(this, this, w, stop, restart) };
-        function unary(op) {
-                if (op == "++" || op == "--")
-                        return found.apply(this, arguments);
-        };
-        return w.with_walkers({
-                "try": found,
-                "throw": found,
-                "return": found,
-                "new": found,
-                "switch": found,
-                "break": found,
-                "continue": found,
-                "assign": found,
-                "call": found,
-                "if": found,
-                "for": found,
-                "for-in": found,
-                "while": found,
-                "do": found,
-                "return": found,
-                "unary-prefix": unary,
-                "unary-postfix": unary,
-                "defun": found
-        }, function(){
-                while (true) try {
-                        walk(ast);
-                        break;
-                } catch(ex) {
-                        if (ex === $stop) break;
-                        if (ex === $restart) continue;
-                        throw ex;
-                }
-        });
-};
-
-function ast_lift_variables(ast) {
-        var w = ast_walker(), walk = w.walk, scope;
-        function do_body(body, env) {
-                var _scope = scope;
-                scope = env;
-                body = MAP(body, walk);
-                var hash = {}, names = MAP(env.names, function(type, name){
-                        if (type != "var") return MAP.skip;
-                        if (!env.references(name)) return MAP.skip;
-                        hash[name] = true;
-                        return [ name ];
-                });
-                if (names.length > 0) {
-                        // looking for assignments to any of these variables.
-                        // we can save considerable space by moving the definitions
-                        // in the var declaration.
-                        for_side_effects([ "block", body ], function(ast, walker, stop, restart) {
-                                if (ast[0] == "assign"
-                                    && ast[1] === true
-                                    && ast[2][0] == "name"
-                                    && HOP(hash, ast[2][1])) {
-                                        // insert the definition into the var declaration
-                                        for (var i = names.length; --i >= 0;) {
-                                                if (names[i][0] == ast[2][1]) {
-                                                        if (names[i][1]) // this name already defined, we must stop
-                                                                stop();
-                                                        names[i][1] = ast[3]; // definition
-                                                        names.push(names.splice(i, 1)[0]);
-                                                        break;
-                                                }
-                                        }
-                                        // remove this assignment from the AST.
-                                        var p = walker.parent();
-                                        if (p[0] == "seq") {
-                                                var a = p[2];
-                                                a.unshift(0, p.length);
-                                                p.splice.apply(p, a);
-                                        }
-                                        else if (p[0] == "stat") {
-                                                p.splice(0, p.length, "block"); // empty statement
-                                        }
-                                        else {
-                                                stop();
-                                        }
-                                        restart();
-                                }
-                                stop();
-                        });
-                        body.unshift([ "var", names ]);
-                }
-                scope = _scope;
-                return body;
-        };
-        function _vardefs(defs) {
-                var ret = null;
-                for (var i = defs.length; --i >= 0;) {
-                        var d = defs[i];
-                        if (!d[1]) continue;
-                        d = [ "assign", true, [ "name", d[0] ], d[1] ];
-                        if (ret == null) ret = d;
-                        else ret = [ "seq", d, ret ];
-                }
-                if (ret == null) {
-                        if (w.parent()[0] == "for-in")
-                                return [ "name", defs[0][0] ];
-                        return MAP.skip;
-                }
-                return [ "stat", ret ];
-        };
-        function _toplevel(body) {
-                return [ this[0], do_body(body, this.scope) ];
-        };
-        return w.with_walkers({
-                "function": function(name, args, body){
-                        for (var i = args.length; --i >= 0 && !body.scope.references(args[i]);)
-                                args.pop();
-                        if (!body.scope.references(name)) name = null;
-                        return [ this[0], name, args, do_body(body, body.scope) ];
-                },
-                "defun": function(name, args, body){
-                        if (!scope.references(name)) return MAP.skip;
-                        for (var i = args.length; --i >= 0 && !body.scope.references(args[i]);)
-                                args.pop();
-                        return [ this[0], name, args, do_body(body, body.scope) ];
-                },
-                "var": _vardefs,
-                "toplevel": _toplevel
-        }, function(){
-                return walk(ast_add_scope(ast));
-        });
-};
-
 function ast_squeeze(ast, options) {
         options = defaults(options, {
                 make_seqs   : true,
                 dead_code   : true,
+                keep_comps  : true,
                 no_warnings : false
         });
 
@@ -5374,11 +5251,13 @@ function ast_squeeze(ast, options) {
                         return best_of(not_c, [ "conditional", c[1], negate(c[2]), negate(c[3]) ]);
                     case "binary":
                         var op = c[1], left = c[2], right = c[3];
-                        switch (op) {
+                        if (!options.keep_comps) switch (op) {
                             case "<="  : return [ "binary", ">", left, right ];
                             case "<"   : return [ "binary", ">=", left, right ];
                             case ">="  : return [ "binary", "<", left, right ];
                             case ">"   : return [ "binary", "<=", left, right ];
+                        }
+                        switch (op) {
                             case "=="  : return [ "binary", "!=", left, right ];
                             case "!="  : return [ "binary", "==", left, right ];
                             case "===" : return [ "binary", "!==", left, right ];
@@ -5389,24 +5268,6 @@ function ast_squeeze(ast, options) {
                         break;
                 }
                 return not_c;
-        };
-
-        function make_conditional(c, t, e) {
-                var make_real_conditional = function() {
-                        if (c[0] == "unary-prefix" && c[1] == "!") {
-                                return e ? [ "conditional", c[2], e, t ] : [ "binary", "||", c[2], t ];
-                        } else {
-                                return e ? best_of(
-                                        [ "conditional", c, t, e ],
-                                        [ "conditional", negate(c), e, t ]
-                                ) : [ "binary", "&&", c, t ];
-                        }
-                };
-                // shortcut the conditional if the expression has a constant value
-                return when_constant(c, function(ast, val){
-                        warn_unreachable(val ? e : t);
-                        return          (val ? t : e);
-                }, make_real_conditional);
         };
 
         function with_scope(s, cont) {
@@ -5431,14 +5292,15 @@ function ast_squeeze(ast, options) {
         function _lambda(name, args, body) {
                 var is_defun = this[0] == "defun";
                 body = with_scope(body.scope, function(){
-                        var ret = tighten(body, "lambda");
-                        if (!is_defun && name && !scope.references(name))
+                        var ret = tighten(MAP(body, walk), "lambda");
+                        if (!is_defun && name && !HOP(scope.refs, name))
                                 name = null;
                         return ret;
                 });
                 return [ this[0], name, args, body ];
         };
 
+        // we get here for blocks that have been already transformed.
         // this function does a few things:
         // 1. discard useless blocks
         // 2. join consecutive var declarations
@@ -5446,8 +5308,6 @@ function ast_squeeze(ast, options) {
         // 4. transform consecutive statements using the comma operator
         // 5. if block_type == "lambda" and it detects constructs like if(foo) return ... - rewrite like if (!foo) { ... }
         function tighten(statements, block_type) {
-                statements = MAP(statements, walk);
-
                 statements = statements.reduce(function(a, stat){
                         if (stat[0] == "block") {
                                 if (stat[1]) {
@@ -5475,17 +5335,7 @@ function ast_squeeze(ast, options) {
                 if (options.dead_code) statements = (function(a, has_quit){
                         statements.forEach(function(st){
                                 if (has_quit) {
-                                        if (st[0] == "function" || st[0] == "defun") {
-                                                a.push(st);
-                                        }
-                                        else if (st[0] == "var" || st[0] == "const") {
-                                                if (!options.no_warnings)
-                                                        warn("Variables declared in unreachable code");
-                                                st[1] = MAP(st[1], function(def){
-                                                        if (def[1] && !options.no_warnings)
-                                                                warn_unreachable([ "assign", true, [ "name", def[0] ], def[1] ]);
-                                                        return [ def[0] ];
-                                                });
+                                        if (member(st[0], [ "function", "defun" , "var", "const" ])) {
                                                 a.push(st);
                                         }
                                         else if (!options.no_warnings)
@@ -5509,38 +5359,27 @@ function ast_squeeze(ast, options) {
                                         prev = cur;
                                 }
                         });
-                        if (a.length >= 2
-                            && a[a.length-2][0] == "stat"
-                            && (a[a.length-1][0] == "return" || a[a.length-1][0] == "throw")
-                            && a[a.length-1][1])
-                        {
-                                a.splice(a.length - 2, 2,
-                                         [ a[a.length-1][0],
-                                           [ "seq", a[a.length-2][1], a[a.length-1][1] ]]);
-                        }
                         return a;
                 })([]);
 
-                // this increases jQuery by 1K.  Probably not such a good idea after all..
-                // part of this is done in prepare_ifs anyway.
-                // if (block_type == "lambda") statements = (function(i, a, stat){
-                //         while (i < statements.length) {
-                //                 stat = statements[i++];
-                //                 if (stat[0] == "if" && !stat[3]) {
-                //                         if (stat[2][0] == "return" && stat[2][1] == null) {
-                //                                 a.push(make_if(negate(stat[1]), [ "block", statements.slice(i) ]));
-                //                                 break;
-                //                         }
-                //                         var last = last_stat(stat[2]);
-                //                         if (last[0] == "return" && last[1] == null) {
-                //                                 a.push(make_if(stat[1], [ "block", stat[2][1].slice(0, -1) ], [ "block", statements.slice(i) ]));
-                //                                 break;
-                //                         }
-                //                 }
-                //                 a.push(stat);
-                //         }
-                //         return a;
-                // })(0, []);
+                if (block_type == "lambda") statements = (function(i, a, stat){
+                        while (i < statements.length) {
+                                stat = statements[i++];
+                                if (stat[0] == "if" && !stat[3]) {
+                                        if (stat[2][0] == "return" && stat[2][1] == null) {
+                                                a.push(make_if(negate(stat[1]), [ "block", statements.slice(i) ]));
+                                                break;
+                                        }
+                                        var last = last_stat(stat[2]);
+                                        if (last[0] == "return" && last[1] == null) {
+                                                a.push(make_if(stat[1], [ "block", stat[2][1].slice(0, -1) ], [ "block", statements.slice(i) ]));
+                                                break;
+                                        }
+                                }
+                                a.push(stat);
+                        }
+                        return a;
+                })(0, []);
 
                 return statements;
         };
@@ -5548,13 +5387,11 @@ function ast_squeeze(ast, options) {
         function make_if(c, t, e) {
                 return when_constant(c, function(ast, val){
                         if (val) {
-                                t = walk(t);
                                 warn_unreachable(e);
-                                return t || [ "block" ];
+                                return t;
                         } else {
-                                e = walk(e);
                                 warn_unreachable(t);
-                                return e || [ "block" ];
+                                return e;
                         }
                 }, function() {
                         return make_real_if(c, t, e);
@@ -5638,6 +5475,9 @@ function ast_squeeze(ast, options) {
                 });
         };
 
+        ast = prepare_ifs(ast);
+        ast = ast_add_scope(ast);
+
         return w.with_walkers({
                 "sub": function(expr, subscript) {
                         if (subscript[0] == "string") {
@@ -5651,13 +5491,13 @@ function ast_squeeze(ast, options) {
                 "if": make_if,
                 "toplevel": function(body) {
                         return [ "toplevel", with_scope(this.scope, function(){
-                                return tighten(body);
+                                return tighten(MAP(body, walk));
                         }) ];
                 },
                 "switch": function(expr, body) {
                         var last = body.length - 1;
                         return [ "switch", walk(expr), MAP(body, function(branch, i){
-                                var block = tighten(branch[1]);
+                                var block = tighten(MAP(branch[1], walk));
                                 if (i == last && block.length > 0) {
                                         var node = block[block.length - 1];
                                         if (node[0] == "break" && !node[1])
@@ -5669,21 +5509,13 @@ function ast_squeeze(ast, options) {
                 "function": _lambda,
                 "defun": _lambda,
                 "block": function(body) {
-                        if (body) return rmblock([ "block", tighten(body) ]);
+                        if (body) return rmblock([ "block", tighten(MAP(body, walk)) ]);
                 },
                 "binary": function(op, left, right) {
                         return when_constant([ "binary", op, walk(left), walk(right) ], function yes(c){
                                 return best_of(walk(c), this);
                         }, function no() {
-                                return function(){
-                                        if(op != "==" && op != "!=") return;
-                                        var l = walk(left), r = walk(right);
-                                        if(l && l[0] == "unary-prefix" && l[1] == "!" && l[2][0] == "num")
-                                                left = ['num', +!l[2][1]];
-                                        else if (r && r[0] == "unary-prefix" && r[1] == "!" && r[2][0] == "num")
-                                                right = ['num', +!r[2][1]];
-                                        return ["binary", op, left, right];
-                                }() || this;
+                                return this;
                         });
                 },
                 "conditional": function(c, t, e) {
@@ -5692,9 +5524,9 @@ function ast_squeeze(ast, options) {
                 "try": function(t, c, f) {
                         return [
                                 "try",
-                                tighten(t),
-                                c != null ? [ c[0], tighten(c[1]) ] : null,
-                                f != null ? tighten(f) : null
+                                tighten(MAP(t, walk)),
+                                c != null ? [ c[0], tighten(MAP(c[1], walk)) ] : null,
+                                f != null ? tighten(MAP(f, walk)) : null
                         ];
                 },
                 "unary-prefix": function(op, expr) {
@@ -5712,25 +5544,23 @@ function ast_squeeze(ast, options) {
                             case "false": return [ "unary-prefix", "!", [ "num", 1 ]];
                         }
                 },
-                "while": _do_while,
-                "assign": function(op, lvalue, rvalue) {
-                        lvalue = walk(lvalue);
-                        rvalue = walk(rvalue);
-                        var okOps = [ '+', '-', '/', '*', '%', '>>', '<<', '>>>', '|', '^', '&' ];
-                        if (op === true && lvalue[0] === "name" && rvalue[0] === "binary" &&
-                            ~okOps.indexOf(rvalue[1]) && rvalue[2][0] === "name" &&
-                            rvalue[2][1] === lvalue[1]) {
-                                return [ this[0], rvalue[1], lvalue, rvalue[3] ]
+                "new": function(ctor, args) {
+                        if (ctor[0] == "name" && ctor[1] == "Array" && !scope.has("Array")) {
+                                if (args.length != 1) {
+                                        return [ "array", args ];
+                                } else {
+                                        return [ "call", [ "name", "Array" ], args ];
+                                }
                         }
-                        return [ this[0], op, lvalue, rvalue ];
-                }
+                },
+                "call": function(expr, args) {
+                        if (expr[0] == "name" && expr[1] == "Array" && args.length != 1 && !scope.has("Array")) {
+                                return [ "array", args ];
+                        }
+                },
+                "while": _do_while
         }, function() {
-                for (var i = 0; i < 2; ++i) {
-                        ast = prepare_ifs(ast);
-                        ast = ast_add_scope(ast);
-                        ast = walk(ast);
-                }
-                return ast;
+                return walk(ast);
         });
 };
 
@@ -5749,7 +5579,7 @@ var DOT_CALL_NO_PARENS = jsp.array_to_hash([
 
 function make_string(str, ascii_only) {
         var dq = 0, sq = 0;
-        str = str.replace(/[\\\b\f\n\r\t\x22\x27\u2028\u2029\0]/g, function(s){
+        str = str.replace(/[\\\b\f\n\r\t\x22\x27\u2028\u2029]/g, function(s){
                 switch (s) {
                     case "\\": return "\\\\";
                     case "\b": return "\\b";
@@ -5761,7 +5591,6 @@ function make_string(str, ascii_only) {
                     case "\u2029": return "\\u2029";
                     case '"': ++dq; return '"';
                     case "'": ++sq; return "'";
-                    case "\0": return "\\0";
                 }
                 return s;
         });
@@ -5876,7 +5705,7 @@ function gen_code(ast, options) {
                         // we're the first in this "seq" and the
                         // parent is "stat", and so on.  Messy stuff,
                         // but it worths the trouble.
-                        var a = slice(w.stack()), self = a.pop(), p = a.pop();
+                        var a = slice($stack), self = a.pop(), p = a.pop();
                         while (p) {
                                 if (p[0] == "stat") return true;
                                 if (((p[0] == "seq" || p[0] == "call" || p[0] == "dot" || p[0] == "sub" || p[0] == "conditional") && p[1] === self) ||
@@ -5894,13 +5723,8 @@ function gen_code(ast, options) {
         function make_num(num) {
                 var str = num.toString(10), a = [ str.replace(/^0\./, ".") ], m;
                 if (Math.floor(num) === num) {
-                        if (num >= 0) {
-                                a.push("0x" + num.toString(16).toLowerCase(), // probably pointless
-                                       "0" + num.toString(8)); // same.
-                        } else {
-                                a.push("-0x" + (-num).toString(16).toLowerCase(), // probably pointless
-                                       "-0" + (-num).toString(8)); // same.
-                        }
+                        a.push("0x" + num.toString(16).toLowerCase(), // probably pointless
+                               "0" + num.toString(8)); // same.
                         if ((m = /^(.*?)(0+)$/.exec(num))) {
                                 a.push(m[1] + "e" + m[2].length);
                         }
@@ -5911,9 +5735,7 @@ function gen_code(ast, options) {
                 return best_of(a);
         };
 
-        var w = ast_walker();
-        var make = w.walk;
-        return w.with_walkers({
+        var generators = {
                 "string": encode_string,
                 "num": make_num,
                 "name": make_name,
@@ -5922,7 +5744,7 @@ function gen_code(ast, options) {
                                 .join(newline + newline);
                 },
                 "splice": function(statements) {
-                        var parent = w.parent();
+                        var parent = $stack[$stack.length - 2][0];
                         if (HOP(SPLICE_NEEDS_BRACKETS, parent)) {
                                 // we need block brackets in this case
                                 return make_block.apply(this, arguments);
@@ -5951,9 +5773,7 @@ function gen_code(ast, options) {
                         return add_spaces([ "throw", make(expr) ]) + ";";
                 },
                 "new": function(ctor, args) {
-                        args = args.length > 0 ? "(" + add_commas(MAP(args, function(expr){
-                                return parenthesize(expr, "seq");
-                        })) + ")" : "";
+                        args = args.length > 0 ? "(" + add_commas(MAP(args, make)) + ")" : "";
                         return add_spaces([ "new", parenthesize(ctor, "seq", "binary", "conditional", "assign", function(expr){
                                 var w = ast_walker(), has_call = {};
                                 try {
@@ -6056,8 +5876,7 @@ function gen_code(ast, options) {
                         //      we need to be smarter.
                         //      adding parens all the time is the safest bet.
                         if (member(lvalue[0], [ "assign", "conditional", "seq" ]) ||
-                            lvalue[0] == "binary" && PRECEDENCE[operator] > PRECEDENCE[lvalue[1]] ||
-                            lvalue[0] == "function" && needs_parens(this)) {
+                            lvalue[0] == "binary" && PRECEDENCE[operator] > PRECEDENCE[lvalue[1]]) {
                                 left = "(" + left + ")";
                         }
                         if (member(rvalue[0], [ "assign", "conditional", "seq" ]) ||
@@ -6090,17 +5909,16 @@ function gen_code(ast, options) {
                         return hash + "[" + make(subscript) + "]";
                 },
                 "object": function(props) {
-                        var obj_needs_parens = needs_parens(this);
                         if (props.length == 0)
-                                return obj_needs_parens ? "({})" : "{}";
-                        var out = "{" + newline + with_indent(function(){
+                                return "{}";
+                        return "{" + newline + with_indent(function(){
                                 return MAP(props, function(p){
                                         if (p.length == 3) {
                                                 // getter/setter.  The name is in p[0], the arg.list in p[1][2], the
                                                 // body in p[1][3] and type ("get" / "set") in p[2].
                                                 return indent(make_function(p[0], p[1][2], p[1][3], p[2]));
                                         }
-                                        var key = p[0], val = parenthesize(p[1], "seq");
+                                        var key = p[0], val = make(p[1]);
                                         if (options.quote_keys) {
                                                 key = encode_string(key);
                                         } else if ((typeof key == "number" || !beautify && +key + "" == key)
@@ -6114,15 +5932,14 @@ function gen_code(ast, options) {
                                                                  : [ key + ":", val ]));
                                 }).join("," + newline);
                         }) + newline + indent("}");
-                        return obj_needs_parens ? "(" + out + ")" : out;
                 },
                 "regexp": function(rx, mods) {
                         return "/" + rx + "/" + mods;
                 },
                 "array": function(elements) {
                         if (elements.length == 0) return "[]";
-                        return add_spaces([ "[", add_commas(MAP(elements, function(el, i){
-                                if (!beautify && el[0] == "atom" && el[1] == "undefined") return i === elements.length - 1 ? "," : "";
+                        return add_spaces([ "[", add_commas(MAP(elements, function(el){
+                                if (!beautify && el[0] == "atom" && el[1] == "undefined") return "";
                                 return parenthesize(el, "seq");
                         })), "]" ]);
                 },
@@ -6141,7 +5958,7 @@ function gen_code(ast, options) {
                 "atom": function(name) {
                         return make_name(name);
                 }
-        }, function(){ return make(ast) });
+        };
 
         // The squeezer replaces "block"-s that contain only a single
         // statement with the statement itself; technically, the AST
@@ -6151,13 +5968,12 @@ function gen_code(ast, options) {
         // to the inner IF).  This function checks for this case and
         // adds the block brackets if needed.
         function make_then(th) {
-                if (th == null) return ";";
                 if (th[0] == "do") {
                         // https://github.com/mishoo/UglifyJS/issues/#issue/57
                         // IE croaks with "syntax error" on code like this:
                         //     if (foo) do ... while(cond); else ...
                         // we need block brackets around do/while
-                        return make_block([ th ]);
+                        return make([ "block", [ th ]]);
                 }
                 var b = th;
                 while (true) {
@@ -6184,31 +6000,20 @@ function gen_code(ast, options) {
                 return add_spaces([ out, make_block(body) ]);
         };
 
-        function must_has_semicolon(node) {
-                switch (node[0]) {
-                    case "with":
-                    case "while":
-                        return empty(node[2]); // `with' or `while' with empty body?
-                    case "for":
-                    case "for-in":
-                        return empty(node[4]); // `for' with empty body?
-                    case "if":
-                        if (empty(node[2]) && !node[3]) return true; // `if' with empty `then' and no `else'
-                        if (node[3]) {
-                                if (empty(node[3])) return true; // `else' present but empty
-                                return must_has_semicolon(node[3]); // dive into the `else' branch
-                        }
-                        return must_has_semicolon(node[2]); // dive into the `then' branch
-                }
-        };
-
         function make_block_statements(statements, noindent) {
                 for (var a = [], last = statements.length - 1, i = 0; i <= last; ++i) {
                         var stat = statements[i];
                         var code = make(stat);
                         if (code != ";") {
-                                if (!beautify && i == last && !must_has_semicolon(stat)) {
-                                        code = code.replace(/;+\s*$/, "");
+                                if (!beautify && i == last) {
+                                        if ((stat[0] == "while" && empty(stat[2])) ||
+                                            (member(stat[0], [ "for", "for-in"] ) && empty(stat[4])) ||
+                                            (stat[0] == "if" && empty(stat[2]) && !stat[3]) ||
+                                            (stat[0] == "if" && stat[3] && empty(stat[3]))) {
+                                                code = code.replace(/;*\s*$/, ";");
+                                        } else {
+                                                code = code.replace(/;+\s*$/, "");
+                                        }
                                 }
                                 a.push(code);
                         }
@@ -6248,6 +6053,20 @@ function gen_code(ast, options) {
                 return name;
         };
 
+        var $stack = [];
+
+        function make(node) {
+                var type = node[0];
+                var gen = generators[type];
+                if (!gen)
+                        throw new Error("Can't find generator for \"" + type + "\"");
+                $stack.push(node);
+                var ret = gen.apply(type, node.slice(1));
+                $stack.pop();
+                return ret;
+        };
+
+        return make(ast);
 };
 
 function split_lines(code, max_line_length) {
@@ -6332,34 +6151,16 @@ var MAP;
 
 (function(){
         MAP = function(a, f, o) {
-                var ret = [], top = [], i;
-                function doit() {
+                var ret = [];
+                for (var i = 0; i < a.length; ++i) {
                         var val = f.call(o, a[i], i);
-                        if (val instanceof AtTop) {
-                                val = val.v;
-                                if (val instanceof Splice) {
-                                        top.push.apply(top, val.v);
-                                } else {
-                                        top.push(val);
-                                }
-                        }
-                        else if (val != skip) {
-                                if (val instanceof Splice) {
-                                        ret.push.apply(ret, val.v);
-                                } else {
-                                        ret.push(val);
-                                }
-                        }
-                };
-                if (a instanceof Array) for (i = 0; i < a.length; ++i) doit();
-                else for (i in a) if (HOP(a, i)) doit();
-                return top.concat(ret);
+                        if (val instanceof AtTop) ret.unshift(val.v);
+                        else ret.push(val);
+                }
+                return ret;
         };
         MAP.at_top = function(val) { return new AtTop(val) };
-        MAP.splice = function(val) { return new Splice(val) };
-        var skip = MAP.skip = {};
         function AtTop(val) { this.v = val };
-        function Splice(val) { this.v = val };
 })();
 
 /* -----[ Exports ]----- */
@@ -6367,7 +6168,6 @@ var MAP;
 exports.ast_walker = ast_walker;
 exports.ast_mangle = ast_mangle;
 exports.ast_squeeze = ast_squeeze;
-exports.ast_lift_variables = ast_lift_variables;
 exports.gen_code = gen_code;
 exports.ast_add_scope = ast_add_scope;
 exports.set_logger = function(logger) { warn = logger };
@@ -6378,7 +6178,9 @@ exports.MAP = MAP;
 // keep this last!
 exports.ast_squeeze_more = require("./squeeze-more").ast_squeeze_more;
 
-});define('uglifyjs/index', ["require", "exports", "module", "./parse-js", "./process"], function(require, exports, module) {
+});
+define('uglifyjs/index', ["require", "exports", "module", "./parse-js", "./process"], function(require, exports, module) {
+
 
 //convienence function(src, [options]);
 function uglify(orig_code, options){
@@ -6398,7 +6200,9 @@ uglify.uglify = require("./process");
 
 module.exports = uglify
 
-});/**
+
+});
+/**
  * @license Copyright (c) 2010-2011, The Dojo Foundation All Rights Reserved.
  * Available via the MIT or new BSD license.
  * see: http://github.com/jrburke/requirejs for details
@@ -6503,132 +6307,30 @@ define('parse', ['uglifyjs/index'], function (uglify) {
     }
 
     /**
-     * Gets dependencies from a node, but only if it is an array literal,
-     * and only if the dependency is a string literal.
-     *
-     * This function does not need to worry about comments, they are not
-     * present in this AST.
-     *
-     * @param {Node} node an AST node.
-     *
-     * @returns {Array} of valid dependencies.
-     * If null is returned, then it means the input node was not a valid
-     * array literal, or did not have any string literals..
-     */
-    function getValidDeps(node) {
-        var newDeps = [],
-            arrayArgs, i, dep;
-
-        if (!node) {
-            return null;
-        }
-
-        if (isObjectLiteral(node) || node[0] === 'function') {
-            return null;
-        }
-
-        //Dependencies can be an object literal or an array.
-        if (!isArrayLiteral(node)) {
-            return null;
-        }
-
-        arrayArgs = node[1];
-
-        for (i = 0; i < arrayArgs.length; i++) {
-            dep = arrayArgs[i];
-            if (dep[0] === 'string') {
-                newDeps.push(dep[1]);
-            }
-        }
-        return newDeps.length ? newDeps : null;
-    }
-
-    /**
      * Main parse function. Returns a string of any valid require or define/require.def
      * calls as part of one JavaScript source string.
-     * @param {String} moduleName the module name that represents this file.
-     * It is used to create a default define if there is not one already for the file.
-     * This allows properly tracing dependencies for builds. Otherwise, if
-     * the file just has a require() call, the file dependencies will not be
-     * properly reflected: the file will come before its dependencies.
-     * @param {String} moduleName
      * @param {String} fileName
      * @param {String} fileContents
-     * @param {Object} options optional options. insertNeedsDefine: true will
-     * add calls to require.needsDefine() if appropriate.
      * @returns {String} JS source string or null, if no require or define/require.def
      * calls are found.
      */
-    function parse(moduleName, fileName, fileContents, options) {
-        options = options || {};
-
+    function parse(fileName, fileContents) {
         //Set up source input
-        var moduleDeps = [],
-            result = '',
-            moduleList = [],
-            needsDefine = true,
-            astRoot = parser.parse(fileContents),
-            i, moduleCall, depString;
+        var matches = [], result = null,
+            astRoot = parser.parse(fileContents);
 
-        parse.recurse(astRoot, function (callName, config, name, deps) {
-            //If name is an array, it means it is an anonymous module,
-            //so adjust args appropriately. An anonymous module could
-            //have a FUNCTION as the name type, but just ignore those
-            //since we just want to find dependencies.
-            if (name && isArrayLiteral(name)) {
-                deps = name;
-                name = null;
-            }
-
-            if (!(deps = getValidDeps(deps))) {
-                deps = [];
-            }
-
-            //Get the name as a string literal, if it is available.
-            if (name && name[0] === 'string') {
-                name = name[1];
-            } else {
-                name = null;
-            }
-
-            if (callName === 'define' && (!name || name === moduleName)) {
-                needsDefine = false;
-            }
-
-            if (!name) {
-                //If there is no module name, the dependencies are for
-                //this file/default module name.
-                moduleDeps = moduleDeps.concat(deps);
-            } else {
-                moduleList.push({
-                    name: name,
-                    deps: deps
-                });
+        parse.recurse(astRoot, function () {
+            var parsed = parse.callToString.apply(parse, arguments);
+            if (parsed) {
+                matches.push(parsed);
             }
         });
 
-        if (options.insertNeedsDefine && needsDefine) {
-            result += 'require.needsDefine("' + moduleName + '");';
+        if (matches.length) {
+            result = matches.join("\n");
         }
 
-        if (moduleDeps.length || moduleList.length) {
-            for (i = 0; (moduleCall = moduleList[i]); i++) {
-                if (result) {
-                    result += '\n';
-                }
-                depString = moduleCall.deps.length ? '["' + moduleCall.deps.join('","') + '"]' : '[]';
-                result += 'define("' + moduleCall.name + '",' + depString + ');';
-            }
-            if (moduleDeps.length) {
-                if (result) {
-                    result += '\n';
-                }
-                depString = moduleDeps.length ? '["' + moduleDeps.join('","') + '"]' : '[]';
-                result += 'define("' + moduleName + '",' + depString + ');';
-            }
-        }
-
-        return result ? result : null;
+        return result;
     }
 
     //Add some private methods to object for use in derived objects.
@@ -6667,7 +6369,7 @@ define('parse', ['uglifyjs/index'], function (uglify) {
 
     /**
      * Finds require("") calls inside a CommonJS anonymous module wrapped in a
-     * define(function(require, exports, module){}) wrapper. These dependencies
+     * define/require.def(function(require, exports, module){}) wrapper. These dependencies
      * will be added to a modified define() call that lists the dependencies
      * on the outside of the function.
      * @param {String} fileName
@@ -6677,7 +6379,7 @@ define('parse', ['uglifyjs/index'], function (uglify) {
      */
     parse.getAnonDeps = function (fileName, fileContents) {
         var astRoot = parser.parse(fileContents),
-            defFunc = this.findAnonDefineFactory(astRoot);
+            defFunc = this.findAnonRequireDefCallback(astRoot);
 
         return parse.getAnonDepsFromNode(defFunc);
     };
@@ -6709,11 +6411,11 @@ define('parse', ['uglifyjs/index'], function (uglify) {
     };
 
     /**
-     * Finds the function in define(function (require, exports, module){});
+     * Finds the function in require.def or define(function (require, exports, module){});
      * @param {Array} node
      * @returns {Boolean}
      */
-    parse.findAnonDefineFactory = function (node) {
+    parse.findAnonRequireDefCallback = function (node) {
         var callback, i, n, call, args;
 
         if (isArray(node)) {
@@ -6723,21 +6425,18 @@ define('parse', ['uglifyjs/index'], function (uglify) {
                 if ((call[0] === 'name' && call[1] === 'define') ||
                            (call[0] === 'dot' && call[1][1] === 'require' && call[2] === 'def')) {
 
-                    //There should only be one argument and it should be a function,
-                    //or a named module with function as second arg
+                    //There should only be one argument and it should be a function.
                     if (args.length === 1 && args[0][0] === 'function') {
                         return args[0];
-                    } else if (args.length === 2 && args[0][0] === 'string' &&
-                               args[1][0] === 'function') {
-                        return args[1];
                     }
+
                 }
             }
 
             //Check child nodes
             for (i = 0; i < node.length; i++) {
                 n = node[i];
-                if ((callback = this.findAnonDefineFactory(n))) {
+                if ((callback = this.findAnonRequireDefCallback(n))) {
                     return callback;
                 }
             }
@@ -6760,7 +6459,8 @@ define('parse', ['uglifyjs/index'], function (uglify) {
         //calls. Can revisit later, but trying to build out larger functional
         //pieces first.
         var dependencies = parse.getAnonDeps(fileName, fileContents),
-            astRoot = parser.parse(fileContents);
+            astRoot = parser.parse(fileContents),
+            i, dep;
 
         parse.recurse(astRoot, function (callName, config, name, deps) {
             //Normalize the input args.
@@ -6769,8 +6469,12 @@ define('parse', ['uglifyjs/index'], function (uglify) {
                 name = null;
             }
 
-            if ((deps = getValidDeps(deps))) {
-                dependencies = dependencies.concat(deps);
+            if (!(deps = validateDeps(deps)) || !isArrayLiteral(deps)) {
+                return;
+            }
+
+            for (i = 0; (dep = deps[1][i]); i++) {
+                dependencies.push(dep[1]);
             }
         });
 
@@ -6849,6 +6553,50 @@ define('parse', ['uglifyjs/index'], function (uglify) {
         return false;
     };
 
+    function optionalString(node) {
+        var str = null;
+        if (node) {
+            str = parse.nodeToString(node);
+        }
+        return str;
+    }
+
+    /**
+     * Convert a require/require.def/define call to a string if it is a valid
+     * call via static analysis of dependencies.
+     * @param {String} callName the name of call (require or define)
+     * @param {Array} the config node inside the call
+     * @param {Array} the name node inside the call
+     * @param {Array} the deps node inside the call
+     */
+    parse.callToString = function (callName, config, name, deps) {
+        //If name is an array, it means it is an anonymous module,
+        //so adjust args appropriately. An anonymous module could
+        //have a FUNCTION as the name type, but just ignore those
+        //since we just want to find dependencies.
+        var configString, nameString, depString;
+        if (name && isArrayLiteral(name)) {
+            deps = name;
+            name = null;
+        }
+
+        if (!(deps = validateDeps(deps))) {
+            return null;
+        }
+
+        //Only serialize the call name, config, module name and dependencies,
+        //otherwise could get local variable names for module value.
+        configString = config && isObjectLiteral(config) && optionalString(config);
+        nameString = optionalString(name);
+        depString = optionalString(deps);
+
+        return callName + "(" +
+            (configString ? configString : "") +
+            (nameString ? (configString ? "," : "") + nameString : "") +
+            (depString ? (configString || nameString ? "," : "") + depString : "") +
+            ");";
+    };
+
     /**
      * Determines if a specific node is a valid require or define/require.def call.
      * @param {Array} node
@@ -6911,16 +6659,10 @@ define('parse', ['uglifyjs/index'], function (uglify) {
 
                         //If first arg is a function, could be a commonjs wrapper,
                         //look inside for commonjs dependencies.
-                        //Also, if deps is a function look for commonjs deps.
                         if (name && name[0] === 'function') {
                             cjsDeps = parse.getAnonDepsFromNode(name);
                             if (cjsDeps.length) {
                                 name = toAstArray(cjsDeps);
-                            }
-                        } else if (deps && deps[0] === 'function') {
-                            cjsDeps = parse.getAnonDepsFromNode(deps);
-                            if (cjsDeps.length) {
-                                deps = toAstArray(cjsDeps);
                             }
                         }
 
@@ -6945,236 +6687,7 @@ define('parse', ['uglifyjs/index'], function (uglify) {
 
     return parse;
 });
-/**
- * @license Copyright (c) 2010-2011, The Dojo Foundation All Rights Reserved.
- * Available via the MIT or new BSD license.
- * see: http://github.com/jrburke/requirejs for details
- */
 
-/*jslint regexp: false, strict: false, plusplus: false  */
-/*global define: false */
-
-define('pragma', ['parse', 'logger'], function (parse, logger) {
-
-    function Temp() {}
-
-    function create(obj, mixin) {
-        Temp.prototype = obj;
-        var temp = new Temp(), prop;
-
-        //Avoid any extra memory hanging around
-        Temp.prototype = null;
-
-        if (mixin) {
-            for (prop in mixin) {
-                if (mixin.hasOwnProperty(prop) && !(prop in temp)) {
-                    temp[prop] = mixin[prop];
-                }
-            }
-        }
-
-        return temp; // Object
-    }
-
-    var pragma = {
-        conditionalRegExp: /(exclude|include)Start\s*\(\s*["'](\w+)["']\s*,(.*)\)/,
-        useStrictRegExp: /['"]use strict['"];/g,
-        hasRegExp: /has\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
-        nsRegExp: /(^|[^\.])(requirejs|require|define)\s*\(/,
-        nsWrapRegExp: /\/\*requirejs namespace: true \*\//,
-        apiDefRegExp: /var requirejs, require, define;/,
-        defineCheckRegExp: /typeof\s+define\s*===\s*["']function["']\s*&&\s*define\s*\.\s*amd/g,
-
-        removeStrict: function (contents, config) {
-            return config.useStrict ? contents : contents.replace(pragma.useStrictRegExp, '');
-        },
-
-        namespace: function (fileContents, ns, onLifecycleName) {
-            if (ns) {
-                //Namespace require/define calls
-                fileContents = fileContents.replace(pragma.nsRegExp, '$1' + ns + '.$2(');
-
-                //Namespace define checks.
-                fileContents = fileContents.replace(pragma.defineCheckRegExp,
-                                                    "typeof " + ns + ".define === 'function' && " + ns + ".define.amd");
-
-                //Check for require.js with the require/define definitions
-                if (pragma.apiDefRegExp.test(fileContents) &&
-                    fileContents.indexOf("if (typeof " + ns + " === 'undefined')") === -1) {
-                    //Wrap the file contents in a typeof check, and a function
-                    //to contain the API globals.
-                    fileContents = "var " + ns + ";(function () { if (typeof " +
-                                    ns + " === 'undefined') {\n" +
-                                    ns + ' = {};\n' +
-                                    fileContents +
-                                    "\n" +
-                                    ns + ".requirejs = requirejs;" +
-                                    ns + ".require = require;" +
-                                    ns + ".define = define;\n" +
-                                    "}\n}());";
-                }
-
-                //Finally, if the file wants a special wrapper because it ties
-                //in to the requirejs internals in a way that would not fit
-                //the above matches, do that. Look for /*requirejs namespace: true*/
-                if (pragma.nsWrapRegExp.test(fileContents)) {
-                    //Remove the pragma.
-                    fileContents = fileContents.replace(pragma.nsWrapRegExp, '');
-
-                    //Alter the contents.
-                    fileContents = '(function () {\n' +
-                                   'var require = ' + ns + '.require,' +
-                                   'requirejs = ' + ns + '.requirejs,' +
-                                   'define = ' + ns + '.define;\n' +
-                                   fileContents +
-                                   '\n}());'
-                }
-            }
-
-            return fileContents;
-        },
-
-        /**
-         * processes the fileContents for some //>> conditional statements
-         */
-        process: function (fileName, fileContents, config, onLifecycleName, pluginCollector) {
-            /*jslint evil: true */
-            var foundIndex = -1, startIndex = 0, lineEndIndex, conditionLine,
-                matches, type, marker, condition, isTrue, endRegExp, endMatches,
-                endMarkerIndex, shouldInclude, startLength, lifecycleHas, deps,
-                i, dep, moduleName,
-                lifecyclePragmas, pragmas = config.pragmas, hasConfig = config.has,
-                //Legacy arg defined to help in dojo conversion script. Remove later
-                //when dojo no longer needs conversion:
-                kwArgs = pragmas;
-
-            //Mix in a specific lifecycle scoped object, to allow targeting
-            //some pragmas/has tests to only when files are saved, or at different
-            //lifecycle events. Do not bother with kwArgs in this section, since
-            //the old dojo kwArgs were for all points in the build lifecycle.
-            if (onLifecycleName) {
-                lifecyclePragmas = config['pragmas' + onLifecycleName];
-                lifecycleHas = config['has' + onLifecycleName];
-
-                if (lifecyclePragmas) {
-                    pragmas = create(pragmas || {}, lifecyclePragmas);
-                }
-
-                if (lifecycleHas) {
-                    hasConfig = create(hasConfig || {}, lifecycleHas);
-                }
-            }
-
-            //Replace has references if desired
-            if (hasConfig) {
-                fileContents = fileContents.replace(pragma.hasRegExp, function (match, test) {
-                    if (test in hasConfig) {
-                        return !!hasConfig[test];
-                    }
-                    return match;
-                });
-            }
-
-            if (!config.skipPragmas) {
-
-                while ((foundIndex = fileContents.indexOf("//>>", startIndex)) !== -1) {
-                    //Found a conditional. Get the conditional line.
-                    lineEndIndex = fileContents.indexOf("\n", foundIndex);
-                    if (lineEndIndex === -1) {
-                        lineEndIndex = fileContents.length - 1;
-                    }
-
-                    //Increment startIndex past the line so the next conditional search can be done.
-                    startIndex = lineEndIndex + 1;
-
-                    //Break apart the conditional.
-                    conditionLine = fileContents.substring(foundIndex, lineEndIndex + 1);
-                    matches = conditionLine.match(pragma.conditionalRegExp);
-                    if (matches) {
-                        type = matches[1];
-                        marker = matches[2];
-                        condition = matches[3];
-                        isTrue = false;
-                        //See if the condition is true.
-                        try {
-                            isTrue = !!eval("(" + condition + ")");
-                        } catch (e) {
-                            throw "Error in file: " +
-                                   fileName +
-                                   ". Conditional comment: " +
-                                   conditionLine +
-                                   " failed with this error: " + e;
-                        }
-
-                        //Find the endpoint marker.
-                        endRegExp = new RegExp('\\/\\/\\>\\>\\s*' + type + 'End\\(\\s*[\'"]' + marker + '[\'"]\\s*\\)', "g");
-                        endMatches = endRegExp.exec(fileContents.substring(startIndex, fileContents.length));
-                        if (endMatches) {
-                            endMarkerIndex = startIndex + endRegExp.lastIndex - endMatches[0].length;
-
-                            //Find the next line return based on the match position.
-                            lineEndIndex = fileContents.indexOf("\n", endMarkerIndex);
-                            if (lineEndIndex === -1) {
-                                lineEndIndex = fileContents.length - 1;
-                            }
-
-                            //Should we include the segment?
-                            shouldInclude = ((type === "exclude" && !isTrue) || (type === "include" && isTrue));
-
-                            //Remove the conditional comments, and optionally remove the content inside
-                            //the conditional comments.
-                            startLength = startIndex - foundIndex;
-                            fileContents = fileContents.substring(0, foundIndex) +
-                                (shouldInclude ? fileContents.substring(startIndex, endMarkerIndex) : "") +
-                                fileContents.substring(lineEndIndex + 1, fileContents.length);
-
-                            //Move startIndex to foundIndex, since that is the new position in the file
-                            //where we need to look for more conditionals in the next while loop pass.
-                            startIndex = foundIndex;
-                        } else {
-                            throw "Error in file: " +
-                                  fileName +
-                                  ". Cannot find end marker for conditional comment: " +
-                                  conditionLine;
-
-                        }
-                    }
-                }
-            }
-
-            //If need to find all plugin resources to optimize, do that now,
-            //before namespacing, since the namespacing will change the API
-            //names.
-            //If there is a plugin collector, scan the file for plugin resources.
-            if (config.optimizeAllPluginResources && pluginCollector) {
-                try {
-                    deps = parse.findDependencies(fileName, fileContents);
-                    if (deps.length) {
-                        for (i = 0; (dep = deps[i]); i++) {
-                            if (dep.indexOf('!') !== -1) {
-                                (pluginCollector[moduleName] ||
-                                 (pluginCollector[moduleName] = [])).push(dep);
-                            }
-                        }
-                    }
-                } catch (eDep) {
-                    logger.error('Parse error looking for plugin resources in ' +
-                                 fileName + ', skipping.');
-                }
-            }
-
-            //Do namespacing
-            if (onLifecycleName === 'OnSave' && config.namespace) {
-                fileContents = pragma.namespace(fileContents, config.namespace, onLifecycleName);
-            }
-
-
-            return pragma.removeStrict(fileContents, config);
-        }
-    };
-
-    return pragma;
-});
 if(env === 'node') {
 /**
  * @license Copyright (c) 2010-2011, The Dojo Foundation All Rights Reserved.
@@ -7270,8 +6783,8 @@ define('rhino/optimize', ['logger'], function (logger) {
             }
             options.prettyPrint = keepLines || options.prettyPrint;
 
-            FLAG_compilation_level = jscomp.CompilationLevel[config.CompilationLevel || 'SIMPLE_OPTIMIZATIONS'];
-            FLAG_compilation_level.setOptionsForCompilationLevel(options);
+            FLAG_compilation_level = flags.Flag.value(jscomp.CompilationLevel[config.CompilationLevel || 'SIMPLE_OPTIMIZATIONS']);
+            FLAG_compilation_level.get().setOptionsForCompilationLevel(options);
 
             //Trigger the compiler
             Compiler.setLoggingLevel(Packages.java.util.logging.Level[config.loggingLevel || 'WARNING']);
@@ -7279,12 +6792,10 @@ define('rhino/optimize', ['logger'], function (logger) {
 
             result = compiler.compile(externSourceFile, jsSourceFile, options);
             if (!result.success) {
-                logger.error('Cannot closure compile file: ' + fileName + '. Skipping it.');
-            } else {
-                fileContents = compiler.toSource();
+                throw new Error("Closure Compiler compilation failed");
             }
 
-            return fileContents;
+            return compiler.toSource();
         }
     };
 
@@ -7301,9 +6812,9 @@ define('rhino/optimize', ['logger'], function (logger) {
 /*global define: false */
 
 define('optimize', [ 'lang', 'logger', 'env!env/optimize', 'env!env/file', 'parse',
-         'pragma', 'uglifyjs/index'],
+         'uglifyjs/index'],
 function (lang,   logger,   envOptimize,        file,           parse,
-          pragma, uglify) {
+          uglify) {
 
     var optimize,
         cssImportRegExp = /\@import\s+(url\()?\s*([^);]+)\s*(\))?([\w, ]*)(;)?/g,
@@ -7443,8 +6954,23 @@ function (lang,   logger,   envOptimize,        file,           parse,
 
             fileContents = file.readFile(fileName);
 
-            //Apply pragmas/namespace renaming
-            fileContents = pragma.process(fileName, fileContents, config, 'OnSave', pluginCollector);
+            //If there is a plugin collector, scan the file for plugin resources.
+            if (config.optimizeAllPluginResources && pluginCollector) {
+                try {
+                    deps = parse.findDependencies(fileName, fileContents);
+                    if (deps.length) {
+                        for (i = 0; (dep = deps[i]); i++) {
+                            if (dep.indexOf('!') !== -1) {
+                                (pluginCollector[moduleName] ||
+                                 (pluginCollector[moduleName] = [])).push(dep);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    logger.error('Parse error looking for plugin resources in ' +
+                                 fileName + ', skipping.');
+                }
+            }
 
             //Optimize the JS files if asked.
             if (optimizerName && optimizerName !== 'none') {
@@ -7553,6 +7079,160 @@ function (lang,   logger,   envOptimize,        file,           parse,
 
     return optimize;
 });/**
+ * @license Copyright (c) 2010-2011, The Dojo Foundation All Rights Reserved.
+ * Available via the MIT or new BSD license.
+ * see: http://github.com/jrburke/requirejs for details
+ */
+
+/*jslint regexp: false, strict: false  */
+/*global define: false */
+
+define('pragma', function () {
+
+    function Temp() {}
+
+    function create(obj, mixin) {
+        Temp.prototype = obj;
+        var temp = new Temp(), prop;
+
+        //Avoid any extra memory hanging around
+        Temp.prototype = null;
+
+        if (mixin) {
+            for (prop in mixin) {
+                if (mixin.hasOwnProperty(prop) && !(prop in temp)) {
+                    temp[prop] = mixin[prop];
+                }
+            }
+        }
+
+        return temp; // Object
+    }
+
+    var pragma = {
+        conditionalRegExp: /(exclude|include)Start\s*\(\s*["'](\w+)["']\s*,(.*)\)/,
+        useStrictRegExp: /['"]use strict['"];/g,
+        hasRegExp: /has\s*\(\s*['"]([^'"]+)['"]\)/g,
+
+        removeStrict: function (contents, config) {
+            return config.useStrict ? contents : contents.replace(pragma.useStrictRegExp, '');
+        },
+
+        /**
+         * processes the fileContents for some //>> conditional statements
+         */
+        process: function (fileName, fileContents, config, onLifecycleName) {
+            /*jslint evil: true */
+            var foundIndex = -1, startIndex = 0, lineEndIndex, conditionLine,
+                matches, type, marker, condition, isTrue, endRegExp, endMatches,
+                endMarkerIndex, shouldInclude, startLength, lifecycleHas,
+                lifecyclePragmas, pragmas = config.pragmas, hasConfig = config.has,
+                //Legacy arg defined to help in dojo conversion script. Remove later
+                //when dojo no longer needs conversion:
+                kwArgs = pragmas;
+
+            //Mix in a specific lifecycle scoped object, to allow targeting
+            //some pragmas/has tests to only when files are saved, or at different
+            //lifecycle events. Do not bother with kwArgs in this section, since
+            //the old dojo kwArgs were for all points in the build lifecycle.
+            if (onLifecycleName) {
+                lifecyclePragmas = config['pragmas' + onLifecycleName];
+                lifecycleHas = config['has' + onLifecycleName];
+
+                if (lifecyclePragmas) {
+                    pragmas = create(pragmas || {}, lifecyclePragmas);
+                }
+
+                if (lifecycleHas) {
+                    hasConfig = create(hasConfig || {}, lifecycleHas);
+                }
+            }
+
+            //Replace has references if desired
+            if (hasConfig) {
+                fileContents = fileContents.replace(pragma.hasRegExp, function (match, test) {
+                    if (test in hasConfig) {
+                        return !!hasConfig[test];
+                    }
+                    return match;
+                });
+            }
+
+            //If pragma work is not desired, skip it.
+            if (config.skipPragmas) {
+                return pragma.removeStrict(fileContents, config);
+            }
+
+            while ((foundIndex = fileContents.indexOf("//>>", startIndex)) !== -1) {
+                //Found a conditional. Get the conditional line.
+                lineEndIndex = fileContents.indexOf("\n", foundIndex);
+                if (lineEndIndex === -1) {
+                    lineEndIndex = fileContents.length - 1;
+                }
+
+                //Increment startIndex past the line so the next conditional search can be done.
+                startIndex = lineEndIndex + 1;
+
+                //Break apart the conditional.
+                conditionLine = fileContents.substring(foundIndex, lineEndIndex + 1);
+                matches = conditionLine.match(pragma.conditionalRegExp);
+                if (matches) {
+                    type = matches[1];
+                    marker = matches[2];
+                    condition = matches[3];
+                    isTrue = false;
+                    //See if the condition is true.
+                    try {
+                        isTrue = !!eval("(" + condition + ")");
+                    } catch (e) {
+                        throw "Error in file: " +
+                               fileName +
+                               ". Conditional comment: " +
+                               conditionLine +
+                               " failed with this error: " + e;
+                    }
+
+                    //Find the endpoint marker.
+                    endRegExp = new RegExp('\\/\\/\\>\\>\\s*' + type + 'End\\(\\s*[\'"]' + marker + '[\'"]\\s*\\)', "g");
+                    endMatches = endRegExp.exec(fileContents.substring(startIndex, fileContents.length));
+                    if (endMatches) {
+                        endMarkerIndex = startIndex + endRegExp.lastIndex - endMatches[0].length;
+
+                        //Find the next line return based on the match position.
+                        lineEndIndex = fileContents.indexOf("\n", endMarkerIndex);
+                        if (lineEndIndex === -1) {
+                            lineEndIndex = fileContents.length - 1;
+                        }
+
+                        //Should we include the segment?
+                        shouldInclude = ((type === "exclude" && !isTrue) || (type === "include" && isTrue));
+
+                        //Remove the conditional comments, and optionally remove the content inside
+                        //the conditional comments.
+                        startLength = startIndex - foundIndex;
+                        fileContents = fileContents.substring(0, foundIndex) +
+                            (shouldInclude ? fileContents.substring(startIndex, endMarkerIndex) : "") +
+                            fileContents.substring(lineEndIndex + 1, fileContents.length);
+
+                        //Move startIndex to foundIndex, since that is the new position in the file
+                        //where we need to look for more conditionals in the next while loop pass.
+                        startIndex = foundIndex;
+                    } else {
+                        throw "Error in file: " +
+                              fileName +
+                              ". Cannot find end marker for conditional comment: " +
+                              conditionLine;
+
+                    }
+                }
+            }
+
+            return pragma.removeStrict(fileContents, config);
+        }
+    };
+
+    return pragma;
+});/**
  * @license RequireJS Copyright (c) 2010-2011, The Dojo Foundation All Rights Reserved.
  * Available via the MIT or new BSD license.
  * see: http://github.com/jrburke/requirejs for details
@@ -7583,30 +7263,6 @@ function (file,           pragma,   parse) {
             oldDef,
             cachedFileContents = {};
 
-
-        /** Print out some extrs info about the module tree that caused the error. **/
-        require.onError = function (err) {
-
-            var msg = '\nIn module tree:\n',
-                standardIndent = '  ',
-                tree = err.moduleTree,
-                i, j, mod;
-
-            if (tree && tree.length > 0) {
-                for (i = tree.length - 1; i > -1 && (mod = tree[i]); i--) {
-                    for (j = tree.length - i; j > -1; j--) {
-                        msg += standardIndent;
-                    }
-                    msg += mod + '\n';
-                }
-
-                err = new Error(err.toString() + msg);
-            }
-
-            throw err;
-        };
-
-
         /** Reset state for each build layer pass. */
         require._buildReset = function () {
             var oldContext = require.s.contexts._;
@@ -7621,12 +7277,15 @@ function (file,           pragma,   parse) {
                 buildPathMap: {},
                 buildFileToModule: {},
                 buildFilePaths: [],
-                pathAdded: {},
+                loadedFiles: {},
                 modulesWithNames: {},
-                needsDefine: {},
                 existingRequireUrl: "",
                 context: require.s.contexts._
             };
+
+            //Set up a per-context list of plugins/pluginBuilders.
+            layer.context.pluginBuilders = {};
+            layer.context._plugins = {};
 
             //Return the previous context in case it is needed, like for
             //the basic config object.
@@ -7651,34 +7310,26 @@ function (file,           pragma,   parse) {
                    url.indexOf('empty:') !== 0;
         };
 
-        //Override define() to catch modules that just define an object, so that
-        //a dummy define call is not put in the build file for them. They do
+        //Override require.def to catch modules that just define an object, so that
+        //a dummy require.def call is not put in the build file for them. They do
         //not end up getting defined via require.execCb, so we need to catch them
-        //at the define call.
-        oldDef = define;
+        //at the require.def call.
+        oldDef = require.def;
 
         //This function signature does not have to be exact, just match what we
         //are looking for.
-        define = function (name, obj) {
-            if (typeof name === "string" && !layer.needsDefine[name]) {
+        define = require.def = function (name, obj) {
+            if (typeof name === "string") {
                 layer.modulesWithNames[name] = true;
             }
             return oldDef.apply(require, arguments);
         };
 
-        //Add some utilities for plugins
+        //Add some utilities for plugins/pluginBuilders
         require._readFile = file.readFile;
         require._fileExists = function (path) {
             return file.exists(path);
         };
-
-        function normalizeUrlWithBase(context, moduleName, url) {
-            //Adjust the URL if it was not transformed to use baseUrl.
-            if (require.jsExtRegExp.test(moduleName)) {
-                url = (context.config.dir || context.config.dirBaseUrl) + url;
-            }
-            return url;
-        }
 
         //Override load so that the file paths can be collected.
         require.load = function (context, moduleName, url) {
@@ -7686,8 +7337,11 @@ function (file,           pragma,   parse) {
             var contents, pluginBuilderMatch, builderName;
 
             //Adjust the URL if it was not transformed to use baseUrl.
-            url = normalizeUrlWithBase(context, moduleName, url);
+            if (require.jsExtRegExp.test(moduleName)) {
+                url = context.config.dirBaseUrl + url;
+            }
 
+            context.loaded[moduleName] = false;
             context.scriptCount += 1;
 
             //Only handle urls that can be inlined, so that means avoiding some
@@ -7698,14 +7352,8 @@ function (file,           pragma,   parse) {
                 layer.buildPathMap[moduleName] = url;
                 layer.buildFileToModule[url] = moduleName;
 
-                if (moduleName in context.plugins) {
-                    //plugins need to have their source evaled as-is.
-                    context.needFullExec[moduleName] = true;
-                }
-
                 try {
-                    if (url in cachedFileContents &&
-                        (!context.needFullExec[moduleName] || context.fullExec[moduleName])) {
+                    if (url in cachedFileContents) {
                         contents = cachedFileContents[url];
                     } else {
                         //Load the file contents, process for conditionals, then
@@ -7715,7 +7363,7 @@ function (file,           pragma,   parse) {
 
                         //Find out if the file contains a require() definition. Need to know
                         //this so we can inject plugins right after it, but before they are needed,
-                        //and to make sure this file is first, so that define calls work.
+                        //and to make sure this file is first, so that require.def calls work.
                         //This situation mainly occurs when the build is done on top of the output
                         //of another build, where the first build may include require somewhere in it.
                         if (!layer.existingRequireUrl && parse.definesRequire(url, contents)) {
@@ -7731,15 +7379,16 @@ function (file,           pragma,   parse) {
                                 builderName = context.normalize(pluginBuilderMatch[3], moduleName);
                                 contents = file.readFile(context.nameToUrl(builderName));
                             }
+
+                            //plugins need to have their source evaled as-is.
+                            context._plugins[moduleName] = true;
                         }
 
                         //Parse out the require and define calls.
                         //Do this even for plugins in case they have their own
                         //dependencies that may be separate to how the pluginBuilder works.
-                        if (!context.needFullExec[moduleName]) {
-                            contents = parse(moduleName, url, contents, {
-                                insertNeedsDefine: true
-                            });
+                        if (!context._plugins[moduleName]) {
+                            contents = parse(url, contents);
                         }
 
                         cachedFileContents[url] = contents;
@@ -7747,86 +7396,53 @@ function (file,           pragma,   parse) {
 
                     if (contents) {
                         eval(contents);
-                    }
 
-                    //Need to close out completion of this module
-                    //so that listeners will get notified that it is available.
-                    try {
+                        //Support anonymous modules.
                         context.completeLoad(moduleName);
-                    } catch (e) {
-                        //Track which module could not complete loading.
-                        (e.moduleTree || (e.moduleTree = [])).push(moduleName);
-                        throw e;
                     }
 
-                } catch (eOuter) {
-                    if (!eOuter.fileName) {
-                        eOuter.fileName = url;
-                    }
-                    throw eOuter;
+                } catch (e) {
+                    e.fileName = url;
+                    e.lineNumber = e.line;
+                    throw e;
                 }
-            } else {
-                //With unsupported URLs still need to call completeLoad to
-                //finish loading.
-                context.completeLoad(moduleName);
+
+                // remember the list of dependencies for this layer.
+                layer.buildFilePaths.push(url);
             }
 
             //Mark the module loaded.
             context.loaded[moduleName] = true;
-        };
 
-
-        //Called when execManager runs for a dependency. Used to figure out
-        //what order of execution.
-        require.onResourceLoad = function (context, map) {
-            var fullName = map.fullName,
-                url;
-
-            //Ignore "fake" modules, usually generated by plugin code, since
-            //they do not map back to a real file to include in the optimizer,
-            //or it will be included, but in a different form.
-            if (context.fake[fullName]) {
-                return;
-            }
-
-            //A plugin.
-            if (map.prefix) {
-                if (!layer.pathAdded[fullName]) {
-                    layer.buildFilePaths.push(fullName);
-                    //For plugins the real path is not knowable, use the name
-                    //for both module to file and file to module mappings.
-                    layer.buildPathMap[fullName] = fullName;
-                    layer.buildFileToModule[fullName] = fullName;
-                    layer.modulesWithNames[fullName] = true;
-                    layer.pathAdded[fullName] = true;
-                }
-            } else if (map.url && require._isSupportedBuildUrl(map.url)) {
-                //If the url has not been added to the layer yet, and it
-                //is from an actual file that was loaded, add it now.
-                if (!layer.pathAdded[url] && layer.buildPathMap[fullName]) {
-                    url = normalizeUrlWithBase(context, map.fullName, map.url);
-                    //Remember the list of dependencies for this layer.
-                    layer.buildFilePaths.push(url);
-                    layer.pathAdded[url] = true;
-                }
+            //Get a handle on the pluginBuilder
+            if (context._plugins[moduleName]) {
+                context.pluginBuilders[moduleName] = context.defined[moduleName];
             }
         };
 
-        //Called by output of the parse() function, when a file does not
-        //explicitly call define, probably just require, but the parse()
-        //function normalizes on define() for dependency mapping and file
-        //ordering works correctly.
-        require.needsDefine = function (moduleName) {
-            layer.needsDefine[moduleName] = true;
+        //This method is called when a plugin specifies a loaded value. Use
+        //this to track dependencies that do not go through require.load.
+        require.onPluginLoad = function (context, pluginName, name, value) {
+            var registeredName = pluginName + '!' + (name || '');
+            layer.buildFilePaths.push(registeredName);
+            //For plugins the real path is not knowable, use the name
+            //for both module to file and file to module mappings.
+            layer.buildPathMap[registeredName] = registeredName;
+            layer.buildFileToModule[registeredName] = registeredName;
+            layer.modulesWithNames[registeredName] = true;
         };
 
-        //Marks module has having a name, and optionally executes the
-        //callback, but only if it meets certain criteria.
+        //Marks the module as part of the loaded set, and puts
+        //it in the right position for output in the build layer,
+        //since require() already did the dependency checks and should have
+        //called this method already for those dependencies.
         require.execCb = function (name, cb, args, exports) {
-            if (!layer.needsDefine[name]) {
+            var url = name && layer.buildPathMap[name];
+            if (url && !layer.loadedFiles[url]) {
+                layer.loadedFiles[url] = true;
                 layer.modulesWithNames[name] = true;
             }
-            if (cb.__requireJsBuild || layer.context.needFullExec[name]) {
+            if (cb.__requireJsBuild || layer.context._plugins[name]) {
                 return cb.apply(exports, args);
             }
             return undefined;
@@ -7919,7 +7535,7 @@ define('commonJs', ['env!env/file', 'uglifyjs/index'], function (file, uglify) {
          * Regexp for testing if there is already a require.def call in the file,
          * in which case do not try to convert it.
          */
-        defRegExp: /define\s*\(/,
+        defRegExp: /(require\s*\.\s*def|define)\s*\(/,
 
         /**
          * Regexp for testing if there is a require([]) or require(function(){})
@@ -7999,10 +7615,10 @@ define('build', [ 'lang', 'logger', 'env!env/file', 'parse', 'optimize', 'pragma
          'env!env/load', 'requirePatch'],
 function (lang,   logger,   file,          parse,    optimize,   pragma,
           load,           requirePatch) {
-    var build, buildBaseConfig,
-        endsWithSemiColonRegExp = /;\s*$/;
+    var build, buildBaseConfig;
 
     buildBaseConfig = {
+            requireBuildPath: "../",
             appDir: "",
             pragmas: {},
             paths: {},
@@ -8010,24 +7626,8 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
             optimizeCss: "standard.keepLines",
             inlineText: true,
             isBuild: true,
-            optimizeAllPluginResources: false,
-            //By default, all files/directories are copied, unless
-            //they match this regexp, by default just excludes .folders
-            dirExclusionRegExp: file.dirExclusionRegExp
+            optimizeAllPluginResources: false
         };
-
-    /**
-     * Some JS may not be valid if concatenated with other JS, in particular
-     * the style of omitting semicolons and rely on ASI. Add a semicolon in
-     * those cases.
-     */
-    function addSemiColon(text) {
-        if (endsWithSemiColonRegExp.test(text)) {
-            return text;
-        } else {
-            return text + ";";
-        }
-    }
 
     /**
      * If the path looks like an URL, throw an error. This is to prevent
@@ -8040,8 +7640,7 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
             throw new Error('Path is not supported: ' + path +
                             '\nOptimizer can only handle' +
                             ' local paths. Download the locally if necessary' +
-                            ' and update the config to use a local path.\n' +
-                            'http://requirejs.org/docs/errors.html#pathnotsupported');
+                            ' and update the config to use a local path.');
         }
     }
 
@@ -8055,18 +7654,9 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
 
     //Method used by plugin writeFile calls, defined up here to avoid
     //jslint warning about "making a function in a loop".
-    function makeWriteFile(anonDefRegExp, namespaceWithDot, layer) {
-        function writeFile(name, contents) {
-            logger.trace('Saving plugin-optimized file: ' + name);
-            file.saveUtf8File(name, contents);
-        }
-
-        writeFile.asModule = function (moduleName, fileName, contents) {
-            writeFile(fileName,
-                build.toTransport(anonDefRegExp, namespaceWithDot, moduleName, fileName, contents, layer));
-        };
-
-        return writeFile;
+    function writeFile(name, contents) {
+        logger.trace('Saving plugin-optimized file: ' + name);
+        file.saveUtf8File(name, contents);
     }
 
     /**
@@ -8078,6 +7668,10 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
      * If it is an object, then in addition to the normal properties allowed in
      * a build profile file, the object should contain one other property:
      *
+     * requireBuildPath: a string that is the path to find require.js and the
+     * require/ directory. This should be a pristine require.js with only
+     * require.js contents (no plugins or jQuery).
+     *
      * The object could also contain a "buildFile" property, which is a string
      * that is the file path to a build profile that contains the rest
      * of the build profile directives.
@@ -8086,31 +7680,39 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
      * there is a problem completing the build.
      */
     build = function (args) {
-        var buildFile, cmdConfig;
+        var requireBuildPath, buildFile, cmdConfig;
 
         if (!args || lang.isArray(args)) {
-            if (!args || args.length < 1) {
-                logger.error("build.js buildProfile.js\n" +
+            if (!args || args.length < 2) {
+                logger.error("build.js directory/containing/build.js/ buildProfile.js\n" +
                       "where buildProfile.js is the name of the build file (see example.build.js for hints on how to make a build file).");
-                return undefined;
+                return;
             }
+
+            //Second argument should be the directory on where to find this script.
+            //This path should end in a slash.
+            requireBuildPath = args[0];
+            requireBuildPath = endsWithSlash(requireBuildPath);
 
             //Next args can include a build file path as well as other build args.
             //build file path comes first. If it does not contain an = then it is
             //a build file path. Otherwise, just all build args.
-            if (args[0].indexOf("=") === -1) {
-                buildFile = args[0];
+            if (args[1].indexOf("=") === -1) {
+                buildFile = args[1];
+                args.splice(0, 2);
+            } else {
                 args.splice(0, 1);
             }
 
             //Remaining args are options to the build
             cmdConfig = build.convertArrayToObject(args);
             cmdConfig.buildFile = buildFile;
+            cmdConfig.requireBuildPath = requireBuildPath;
         } else {
             cmdConfig = args;
         }
 
-        return build._run(cmdConfig);
+        build._run(cmdConfig);
     };
 
     build._run = function (cmdConfig) {
@@ -8132,8 +7734,8 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         config = build.createConfig(cmdConfig);
         paths = config.paths;
 
-        if (config.logLevel) {
-            logger.logLevel(config.logLevel);
+        if ( config.logLevel ) {
+            logger.logLevel( config.logLevel );
         }
 
         if (!config.out && !config.cssIn) {
@@ -8244,7 +7846,7 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         //Run CSS optimizations before doing JS module tracing, to allow
         //things like text loader plugins loading CSS to get the optimized
         //CSS.
-        if (config.optimizeCss && config.optimizeCss !== "none" && config.dir) {
+        if (config.optimizeCss && config.optimizeCss !== "none") {
             optimize.css(config.dir, config);
         }
 
@@ -8309,17 +7911,9 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
             optimize.jsFile(fileName, fileName, config);
         } else if (!config.cssIn) {
             //Normal optimizations across modules.
-            
+
             //JS optimizations.
-            if(config.minifyOnlyAggregatedFiles) {
-              fileNames = [];
-              modules.forEach(function (module) {
-                fileNames.push(config.dir + module.name + ".js");
-              });
-            } else {
-              fileNames = file.getFilteredFileList(config.dir, /\.js$/, true);
-            }
-            
+            fileNames = file.getFilteredFileList(config.dir, /\.js$/, true);
             for (i = 0; (fileName = fileNames[i]); i++) {
                 //Generate the module name from the config.dir root.
                 moduleName = fileName.replace(config.dir, '');
@@ -8369,10 +7963,7 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                                     moduleMap.prefix,
                                     moduleMap.name,
                                     require,
-                                    makeWriteFile(
-                                        config.anonDefRegExp,
-                                        config.namespaceWithDot
-                                    ),
+                                    writeFile,
                                     context.config
                                 );
                             }
@@ -8399,25 +7990,8 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         //Print out what was built into which layers.
         if (buildFileContents) {
             logger.info(buildFileContents);
-            return buildFileContents;
         }
-
-        return '';
     };
-
-    /**
-     * Converts command line args like "paths.foo=../some/path"
-     * result.paths = { foo: '../some/path' } where prop = paths,
-     * name = paths.foo and value = ../some/path, so it assumes the
-     * name=value splitting has already happened.
-     */
-    function stringDotToObj(result, prop, name, value) {
-        if (!result[prop]) {
-            result[prop] = {};
-        }
-        name = name.substring((prop + '.').length, name.length);
-        result[prop][name] = value;
-    }
 
     /**
      * Converts an array that has String members of "name=value"
@@ -8455,8 +8029,14 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                 value = value.split(",");
             }
 
-            if (prop.indexOf("paths.") === 0 || prop.indexOf("wrap.") === 0) {
-                stringDotToObj(result, prop.split('.')[0], prop, value);
+            if (prop.indexOf("paths.") === 0) {
+                //Special handling of paths properties. paths.foo=bar is transformed
+                //to data.paths = {foo: 'bar'}
+                if (!result.paths) {
+                    result.paths = {};
+                }
+                prop = prop.substring("paths.".length, prop.length);
+                result.paths[prop] = value;
             } else {
                 result[prop] = value;
             }
@@ -8473,7 +8053,7 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                    path;
             path = file.normalize(path);
         }
-        return path.replace(lang.backSlashRegExp, '/');
+        return path;
     };
 
     /**
@@ -8495,7 +8075,15 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         lang.mixin(config, buildBaseConfig);
         lang.mixin(config, cfg, true);
 
-        absFilePath = file.absPath('.');
+        //Normalize build directory location, and set up path to require.js
+        if (config.requireBuildPath.charAt(config.requireBuildPath.length - 1) !== "/") {
+            config.requireBuildPath += "/";
+            //Also adjust the override config params, since it
+            //may be re-applied later after reading the build file.
+            if (cfg.requireBuildPath) {
+                cfg.requireBuildPath = config.requireBuildPath;
+            }
+        }
 
         if (config.buildFile) {
             //A build file exists, load it to get more config.
@@ -8522,16 +8110,22 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
             //Re-apply the override config values, things like command line
             //args should take precedence over build file values.
             lang.mixin(config, cfg, true);
-        } else if (config.cssIn) {
+        } else {
+            if (!config.out && !config.cssIn) {
+                throw new Error("ERROR: 'out' or 'cssIn' option missing.");
+            }
             if (!config.out) {
                 throw new Error("ERROR: 'out' option missing.");
             } else {
                 config.out = config.out.replace(lang.backSlashRegExp, "/");
             }
-        }
 
-        if (!config.cssIn && !config.baseUrl) {
-            throw new Error("ERROR: 'baseUrl' option missing.");
+            if (!config.cssIn && !cfg.baseUrl) {
+                throw new Error("ERROR: 'baseUrl' option missing.");
+            }
+
+            //In this scenario, the absFile path is current directory
+            absFilePath = file.absPath('.');
         }
 
         if (config.out && !config.cssIn) {
@@ -8556,9 +8150,6 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                 config.optimizeCss = "none";
             }
         }
-        
-        //Should we minify everything, or just aggregated files?
-        config.minifyOnlyAggregatedFiles = config.minifyOnlyAggregatedFiles || false;
 
         //Adjust the path properties as appropriate.
         //First make sure build paths use front slashes and end in a slash,
@@ -8600,7 +8191,6 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
         if (config.paths) {
             for (prop in config.paths) {
                 if (config.paths.hasOwnProperty(prop)) {
-                    config.paths[prop] = config.paths[prop].replace(lang.backSlashRegExp, "/");
                     disallowUrls(config.paths[prop]);
                 }
             }
@@ -8612,45 +8202,6 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
             if (config[prop]) {
                 config[prop] = build.makeAbsPath(config[prop], absFilePath);
             }
-        }
-
-        //Get any wrap text.
-        try {
-            if (config.wrap) {
-                if (config.wrap === true) {
-                    //Use default values.
-                    config.wrap = {
-                        start: '(function () {',
-                        end: '}());'
-                    };
-                } else {
-                    config.wrap.start = config.wrap.start ||
-                            file.readFile(build.makeAbsPath(config.wrap.startFile, absFilePath));
-                    config.wrap.end = config.wrap.end ||
-                            file.readFile(build.makeAbsPath(config.wrap.endFile, absFilePath));
-                }
-            }
-        } catch (wrapError) {
-            throw new Error('Malformed wrap config: need both start/end or ' +
-                            'startFile/endFile: ' + wrapError.toString());
-        }
-
-
-        //Set up proper info for namespaces and using namespaces in transport
-        //wrappings.
-        config.namespaceWithDot = config.namespace ? config.namespace + '.' : '';
-        config.anonDefRegExp = build.makeAnonDefRegExp(config.namespaceWithDot);
-
-        //Do final input verification
-        if (config.context) {
-            throw new Error('The build argument "context" is not supported' +
-                            ' in a build. It should only be used in web' +
-                            ' pages.');
-        }
-
-        //Set file.dirExclusionRegExp if desired
-        if ('dirExclusionRegExp' in config) {
-            file.dirExclusionRegExp = config.dirExclusionRegExp;
         }
 
         return config;
@@ -8763,9 +8314,7 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
      */
     build.flattenModule = function (module, layer, config) {
         var buildFileContents = "",
-            namespace = config.namespace ? config.namespace + '.' : '',
             context = layer.context,
-            anonDefRegExp = config.anonDefRegExp,
             path, reqIndex, fileContents, currContents,
             i, moduleName,
             parts, builder, writeApi;
@@ -8798,31 +8347,24 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
             //Figure out if the module is a result of a build plugin, and if so,
             //then delegate to that plugin.
             parts = context.makeModuleMap(moduleName);
-            builder = parts.prefix && context.defined[parts.prefix];
+            builder = parts.prefix && context.pluginBuilders[parts.prefix];
             if (builder) {
                 if (builder.write) {
                     writeApi = function (input) {
-                        fileContents += "\n" + addSemiColon(input);
+                        fileContents += input;
                     };
                     writeApi.asModule = function (moduleName, input) {
-                        fileContents += "\n" +
-                                        addSemiColon(
-                                            build.toTransport(anonDefRegExp, namespace, moduleName, path, input, layer));
+                        fileContents += "\n" + build.toTransport(moduleName, path, input, layer);
                     };
                     builder.write(parts.prefix, parts.name, writeApi);
                 }
             } else {
-                currContents = file.readFile(path);
+                //Add the contents but remove any pragmas.
+                currContents = pragma.process(path, file.readFile(path), config, 'OnSave');
 
-                if (config.namespace) {
-                    currContents = pragma.namespace(currContents, config.namespace);
-                }
+                currContents = build.toTransport(moduleName, path, currContents, layer);
 
-                currContents = build.toTransport(anonDefRegExp, namespace, moduleName, path, currContents, layer);
-
-                //Semicolon is for files that are not well formed when
-                //concatenated with other content.
-                fileContents += "\n" + addSemiColon(currContents);
+                fileContents += "\n" + currContents;
             }
 
             buildFileContents += path.replace(config.dir, "") + "\n";
@@ -8838,63 +8380,35 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                 if (moduleName === 'jquery') {
                     fileContents += '\n(function () {\n' +
                                    'var jq = typeof jQuery !== "undefined" && jQuery;\n' +
-                                   namespace +
                                    'define("jquery", [], function () { return jq; });\n' +
                                    '}());\n';
                 } else {
-                    fileContents += '\n' + namespace + 'define("' + moduleName + '", function(){});\n';
+                    fileContents += '\ndefine("' + moduleName + '", function(){});\n';
                 }
             }
         }
 
         return {
-            text: config.wrap ?
-                    config.wrap.start + fileContents + config.wrap.end :
-                    fileContents,
+            text: fileContents,
             buildText: buildFileContents
         };
     };
 
-    /**
-     * Creates the regexp to find anonymous defines.
-     * @param {String} namespace an optional namespace to use. The namespace
-     * should *include* a trailing dot. So a valid value would be 'foo.'
-     * @returns {RegExp}
-     */
-    build.makeAnonDefRegExp = function (namespace) {
-        //This regexp is not bullet-proof, and it has one optional part to
-        //avoid issues with some Dojo transition modules that use a
-        //define(\n//begin v1.x content
-        //for a comment.
-        return new RegExp('(^|[^\\.])(' + (namespace || '').replace(/\./g, '\\.') +
-                          'define|define)\\s*\\(\\s*(\\/\\/[^\\n\\r]*[\\r\\n])?(\\[|f|\\{|["\']([^"\']+)["\'])(\\s*,\\s*f)?');
-    };
+    //This regexp is not bullet-proof, and it has one optional part to
+    //avoid issues with some Dojo transition modules that use a
+    //define(\n//begin v1.x content
+    //for a comment.
+    build.anonDefRegExp = /(^|[^\.])(require\s*\.\s*def|define)\s*\(\s*(\/\/[^\n\r]*[\r\n])?(\[|f|\{)/;
 
-    build.leadingCommaRegExp = /^\s*,/;
-
-    build.toTransport = function (anonDefRegExp, namespace, moduleName, path, contents, layer) {
-
+    build.toTransport = function (moduleName, path, contents, layer) {
         //If anonymous module, insert the module name.
-        return contents.replace(anonDefRegExp, function (match, start, callName, possibleComment, suffix, namedModule, namedFuncStart) {
-            //A named module with either listed dependencies or an object
-            //literal for a value. Skip it. If named module, only want ones
-            //whose next argument is a function literal to scan for
-            //require('') dependecies.
-            if (namedModule && !namedFuncStart) {
-                return match;
-            }
-
-            if (layer) {
-                layer.modulesWithNames[moduleName] = true;
-            }
-
-            var deps = null;
+        return contents.replace(build.anonDefRegExp, function (match, start, callName, possibleComment, suffix) {
+            layer.modulesWithNames[moduleName] = true;
 
             //Look for CommonJS require calls inside the function if this is
-            //an anonymous define call that just has a function registered.
-            //Also look if a named define function but has a factory function
-            //as the second arg that should be scanned for dependencies.
-            if (suffix.indexOf('f') !== -1 || (namedModule)) {
+            //an anonymous define/require.def call that just has a function registered.
+            var deps = null;
+            if (suffix.indexOf('f') !== -1) {
                 deps = parse.getAnonDeps(path, contents);
 
                 if (deps.length) {
@@ -8906,9 +8420,9 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
                 }
             }
 
-            return start + namespace + "define('" + moduleName + "'," +
+            return "define('" + moduleName + "'," +
                    (deps ? ('[' + deps.toString() + '],') : '') +
-                   (namedModule ? namedFuncStart.replace(build.leadingCommaRegExp, '') : suffix);
+                   suffix;
         });
 
     };
@@ -8937,45 +8451,7 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
     //If in Node, and included via a require('requirejs'), just export and
     //THROW IT ON THE GROUND!
     if (env === 'node' && reqMain !== module) {
-        setBaseUrl(path.resolve(reqMain ? reqMain.filename : '.'));
-
-        //Create a method that will run the optimzer given an object
-        //config.
-        requirejs.optimize = function (config, callback) {
-            if (!loadedOptimizedLib) {
-                loadLib();
-                loadedOptimizedLib = true;
-            }
-
-            //Create the function that will be called once build modules
-            //have been loaded.
-            var runBuild = function (build, logger) {
-                //Make sure config has a log level, and if not,
-                //make it "silent" by default.
-                config.logLevel = config.hasOwnProperty('logLevel') ?
-                                  config.logLevel : logger.SILENT;
-
-                var result = build(config);
-
-                //Reset build internals on each run.
-                requirejs._buildReset();
-
-                callback(result);
-            };
-
-            //Enable execution of this callback in a build setting.
-            //Normally, once requirePatch is run, by default it will
-            //not execute callbacks, unless this property is set on
-            //the callback.
-            runBuild.__requireJsBuild = true;
-
-            requirejs({
-                context: 'build'
-            }, ['build', 'logger'], runBuild);
-        };
-
-        requirejs.define = define;
-
+        setBaseUrl(path.resolve(reqMain.filename));
         module.exports = requirejs;
         return;
     }
@@ -8995,20 +8471,38 @@ function (lang,   logger,   file,          parse,    optimize,   pragma,
  * build file to this file to do the build. See example.build.js for more information.
  */
 
-/*jslint strict: false, nomen: false */
+/*jslint strict: false */
 /*global require: false */
 
 require({
     baseUrl: require.s.contexts._.config.baseUrl,
     //Use a separate context than the default context so that the
     //build can use the default context.
-    context: 'build',
-    catchError: {
-        define: true
-    }
+    context: 'build'
 },       ['env!env/args', 'build'],
 function (args,            build) {
-    build(args);
+    var buildArgs = args, rjsBuildDir;
+
+    if (typeof isRjs !== 'undefined' && isRjs) {
+        //Shift on a base path used to find optimizer modules. However,
+        //since this case is for r.js that has them built in, just
+        //use some arbitrary path.
+        buildArgs.unshift('.');
+    } else {
+        //This is call was done in a script that does not include the built
+        //modules so take off the first argument since it is for
+        //are a path inside r.js for use by the bootstrap.
+        buildArgs = buildArgs.slice(1);
+        rjsBuildDir = buildArgs[0].replace(/\\/g, '/');
+
+        //The second arg is the full path for this script. The
+        //directory portion is the only part needed though, so adjust it.
+        rjsBuildDir = rjsBuildDir.split('/');
+        rjsBuildDir.pop();
+        buildArgs[0] = rjsBuildDir.length ? rjsBuildDir.join('/') : '.';
+    }
+
+    build(buildArgs);
 });
 
 
