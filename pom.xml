@@ -7,8 +7,8 @@
 		<version>5</version>
 	</parent>
 
-	<groupId>com.voltvoodoo</groupId>
-	<artifactId>brew</artifactId>
+	<groupId>ext</groupId>
+	<artifactId>com.voltvoodoo.brew</artifactId>
 	<name>Brew</name>
 	<version>0.2.11-SNAPSHOT</version>
 	<packaging>maven-plugin</packaging>
@@ -271,15 +271,15 @@
 	<distributionManagement>
 		<repository>
 			<uniqueVersion>false</uniqueVersion>
-			<id>sonatype-repo</id>
-			<name>Sonatype Repository</name>
-			<url>https://oss.sonatype.org/service/local/staging/deploy/maven2</url>
+			<id>releases</id>
+			<name>Releases</name>
+			<url>http://nexus.vpro.nl/content/repositories/releases</url>
 		</repository>
 		<snapshotRepository>
 			<uniqueVersion>true</uniqueVersion>
-			<id>sonatype-snapshot-repo</id>
-			<name>Sonatype Snapshots Repository</name>
-			<url>https://oss.sonatype.org/content/repositories/snapshots</url>
+			<id>nexus</id>
+			<name>Snaphots</name>
+			<url>http://nexus.vpro.nl/content/repositories/snapshots</url>
 		</snapshotRepository>
 	</distributionManagement>
 
